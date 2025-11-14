@@ -1,3 +1,4 @@
 .vscode/
 ldap.conf.json
+mail.conf.json
 main

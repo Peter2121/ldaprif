@@ -14,15 +14,16 @@ import (
 )
 
 var LdapConfigFileName = "ldap.conf.json"
+var MailConfigFileName = "mail.conf.json"
 
-func ReadConfig(config_file_path string) (*ldap.Config, error) {
+func ReadConfig[T ldap.ConfigLdap | ldap.ConfigMail](config_file_path string) (*T, error) {
 	config_file, err := os.Open(config_file_path)
 	if err != nil {
 		return nil, err
 	}
 	defer config_file.Close()
 
-	var config ldap.Config
+	var config T
 	config_file_content, _ := io.ReadAll(config_file)
 	err = json.Unmarshal(config_file_content, &config)
 	if err != nil {
@@ -31,15 +32,39 @@ func ReadConfig(config_file_path string) (*ldap.Config, error) {
 	return &config, nil
 }
 
+func ReadConfigLdap(config_file_path string) (*ldap.ConfigLdap, error) {
+	return ReadConfig[ldap.ConfigLdap](config_file_path)
+}
+
+func ReadConfigMail(config_file_path string) (*ldap.ConfigMail, error) {
+	return ReadConfig[ldap.ConfigMail](config_file_path)
+}
+
 func main() {
 
-	config, err := ReadConfig(LdapConfigFileName)
-	if (err != nil) || (config == nil) {
-		fmt.Printf("FATAL: Cannot read configuration file %s: %v\n", LdapConfigFileName, err)
+	ldap_config, errlc := ReadConfigLdap(LdapConfigFileName)
+	if errlc != nil {
+		fmt.Printf("FATAL: Cannot read ldap configuration file %s: %v\n", LdapConfigFileName, errlc)
 		return
 	}
 
-	ldap_data_handler := handlers.NewLdapDataHandler(config)
+	if ldap_config == nil {
+		fmt.Printf("FATAL: Cannot read ldap configuration file %s\n", LdapConfigFileName)
+		return
+	}
+
+	mail_config, errmc := ReadConfigMail(MailConfigFileName)
+	if errmc != nil {
+		fmt.Printf("FATAL: Cannot mail configuration file %s: %v\n", MailConfigFileName, errmc)
+		return
+	}
+
+	if mail_config == nil {
+		fmt.Printf("FATAL: Cannot read mail configuration file %s\n", MailConfigFileName)
+		return
+	}
+
+	ldap_data_handler := handlers.NewLdapDataHandler(ldap_config, mail_config)
 	if ldap_data_handler == nil {
 		log.Printf("FATAL: Cannot create LDAP data handler")
 	}
@@ -50,6 +75,16 @@ func main() {
 	// Middlewares globaux
 	app.Use(gofsen.Logger())
 	app.Use(gofsen.Recovery())
+
+	corsConfig := gofsen.CORSConfig{
+		//AllowOrigins: []string{"*"},
+		//AllowMethods: []string{"*"},
+		AllowOrigins: []string{"http://localhost:5173", "http://localhost:8080"},
+		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders: []string{"Content-Type", "Authorization"},
+	}
+
+	app.Use(gofsen.CORSWithConfig(corsConfig))
 
 	app.Use(middleware.AuthMiddleware())
 

@@ -13,14 +13,16 @@ import (
 )
 
 type LdapDataHandler struct {
-	LdapConfig *ldap.Config
+	LdapConfig *ldap.ConfigLdap
+	MailConfig *ldap.ConfigMail
 	LdapClient *ldap.Client
 }
 
-func NewLdapDataHandler(config *ldap.Config, opts ...ldap.ClientOption) *LdapDataHandler {
+func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, opts ...ldap.ClientOption) *LdapDataHandler {
 	ldap_data_handler := LdapDataHandler{}
-	ldap_data_handler.LdapConfig = config
-	ldap_data_handler.LdapClient = ldap.NewClient(config, opts...)
+	ldap_data_handler.LdapConfig = ldap_config
+	ldap_data_handler.MailConfig = mail_config
+	ldap_data_handler.LdapClient = ldap.NewClient(ldap_config, mail_config, opts...)
 	if ldap_data_handler.LdapClient != nil {
 		return &ldap_data_handler
 	} else {
