@@ -1,12 +1,12 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"main/handlers"
-	"main/middleware"
 	"os"
 
 	"github.com/Bakemono-san/gofsen"
@@ -15,6 +15,10 @@ import (
 
 var LdapConfigFileName = "ldap.conf.json"
 var MailConfigFileName = "mail.conf.json"
+
+var JWT_KEY []byte
+
+const JWT_KEY_LENGTH int = 64
 
 func ReadConfig[T ldap.ConfigLdap | ldap.ConfigMail](config_file_path string) (*T, error) {
 	config_file, err := os.Open(config_file_path)
@@ -64,7 +68,10 @@ func main() {
 		return
 	}
 
-	ldap_data_handler := handlers.NewLdapDataHandler(ldap_config, mail_config)
+	JWT_KEY = make([]byte, JWT_KEY_LENGTH)
+	rand.Read(JWT_KEY)
+
+	ldap_data_handler := handlers.NewLdapDataHandler(ldap_config, mail_config, JWT_KEY)
 	if ldap_data_handler == nil {
 		log.Printf("FATAL: Cannot create LDAP data handler")
 	}
@@ -86,11 +93,12 @@ func main() {
 
 	app.Use(gofsen.CORSWithConfig(corsConfig))
 
-	app.Use(middleware.AuthMiddleware())
+	//app.Use(middleware.AuthMiddleware())
 
 	// Routes de base
 	app.GET("/", handlers.HomeHandler)
 	app.GET("/health", handlers.HealthHandler)
+	app.POST("/auth", ldap_data_handler.AuthHandler)
 
 	// Groupes d'API
 	api := app.Group("/api/v1")

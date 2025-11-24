@@ -4,6 +4,8 @@ go 1.24.7
 
 replace github.com/peter2121/ldap-mcli => ../ldap-mcli
 
+replace github.com/Bakemono-san/gofsen v1.2.0 => ../gofsen
+
 require (
 	github.com/Bakemono-san/gofsen v1.2.0
 	github.com/atselvan/go-utils v1.0.7
@@ -26,6 +28,7 @@ require (
 	github.com/go-playground/validator/v10 v10.18.0 // indirect
 	github.com/go-resty/resty/v2 v2.11.0 // indirect
 	github.com/goccy/go-json v0.10.2 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect

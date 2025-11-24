@@ -9,6 +9,7 @@ import (
 	"github.com/Bakemono-san/gofsen"
 	"github.com/atselvan/go-utils/utils/errors"
 	"github.com/atselvan/go-utils/utils/slice"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/peter2121/ldap-mcli/ldap"
 )
 
@@ -16,18 +17,59 @@ type LdapDataHandler struct {
 	LdapConfig *ldap.ConfigLdap
 	MailConfig *ldap.ConfigMail
 	LdapClient *ldap.Client
+	JwtSignKey []byte
+	AuthTokens []string
 }
 
-func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, opts ...ldap.ClientOption) *LdapDataHandler {
+func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, jsik []byte, opts ...ldap.ClientOption) *LdapDataHandler {
 	ldap_data_handler := LdapDataHandler{}
 	ldap_data_handler.LdapConfig = ldap_config
 	ldap_data_handler.MailConfig = mail_config
+	ldap_data_handler.JwtSignKey = jsik
+	ldap_data_handler.AuthTokens = make([]string, 0)
 	ldap_data_handler.LdapClient = ldap.NewClient(ldap_config, mail_config, opts...)
 	if ldap_data_handler.LdapClient != nil {
 		return &ldap_data_handler
 	} else {
 		return nil
 	}
+}
+
+func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
+	type AuthData struct {
+		UserName string `json:"username"`
+		Password string `json:"password"`
+	}
+	var auth_data = AuthData{}
+	if err := c.BindJSON(&auth_data); err != nil {
+		c.Status(400).JSON(map[string]any{
+			"status": "error",
+			"error":  "Invalid JSON",
+		})
+		return
+	}
+	errauth := ldh.LdapClient.AuthenticateUser(auth_data.UserName, auth_data.Password)
+	if errauth != nil {
+		c.JSON(map[string]any{
+			"status": "error",
+			"error":  errauth.Message,
+		})
+		return
+	}
+	auth_token := jwt.New(jwt.SigningMethodHS256)
+	auth_token_signed, errsign := auth_token.SignedString(ldh.JwtSignKey)
+	if errsign != nil {
+		c.JSON(map[string]any{
+			"status": "error",
+			"error":  errsign.Error(),
+		})
+		return
+	}
+	ldh.AuthTokens = append(ldh.AuthTokens, auth_token_signed)
+	c.JSON(map[string]any{
+		"status":     "success",
+		"auth-token": auth_token_signed,
+	})
 }
 
 func (ldh *LdapDataHandler) UsersHandler(c *gofsen.Context) {
