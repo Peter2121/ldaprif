@@ -10,6 +10,7 @@ require (
 	github.com/Bakemono-san/gofsen v1.2.0
 	github.com/atselvan/go-utils v1.0.7
 	github.com/peter2121/ldap-mcli v0.0.0-00010101000000-000000000000
+	github.com/pierrec/xxHash v0.1.5
 )
 
 require (

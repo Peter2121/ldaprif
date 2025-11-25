@@ -5,21 +5,53 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/Bakemono-san/gofsen"
 	"github.com/atselvan/go-utils/utils/errors"
 	"github.com/atselvan/go-utils/utils/slice"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/peter2121/ldap-mcli/ldap"
+	"github.com/pierrec/xxHash/xxHash32"
 )
 
 type LdapDataHandler struct {
-	LdapConfig *ldap.ConfigLdap
-	MailConfig *ldap.ConfigMail
-	LdapClient *ldap.Client
-	JwtSignKey []byte
-	AuthTokens []string
+	LdapConfig    *ldap.ConfigLdap
+	MailConfig    *ldap.ConfigMail
+	LdapClient    *ldap.Client
+	JwtSignKey    []byte
+	AuthTokens    []string
+	RefreshTokens []string
 }
+
+type JwtAuthData struct {
+	ID       string `json:"jti"`
+	Issuer   string `json:"iss"`
+	Subject  string `json:"sub"`
+	Audience string `json:"aud"`
+	ExpTime  string `json:"exp"`
+	IssTime  string `json:"iat"`
+	Scope    string `json:"sco"`
+	IsAdmin  string `json:"iad"`
+}
+
+type JwtRefrData struct {
+	ID       string `json:"jti"`
+	Issuer   string `json:"iss"`
+	Subject  string `json:"sub"`
+	Audience string `json:"aud"`
+	ExpTime  string `json:"exp"`
+	IssTime  string `json:"iat"`
+}
+
+type JwtResponse struct {
+	JwtAuthToken    string `json:"auth_token"`
+	JwtRefreshToken string `json:"refresh_token"`
+}
+
+const JWT_AUTH_VALIDITY_MINS = 20
+const JWT_REFRESH_VALIDITY_MINS = 1440
+const JWT_REFRESH_SUBJECT string = "Refresh"
 
 func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, jsik []byte, opts ...ldap.ClientOption) *LdapDataHandler {
 	ldap_data_handler := LdapDataHandler{}
@@ -27,6 +59,7 @@ func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMa
 	ldap_data_handler.MailConfig = mail_config
 	ldap_data_handler.JwtSignKey = jsik
 	ldap_data_handler.AuthTokens = make([]string, 0)
+	ldap_data_handler.RefreshTokens = make([]string, 0)
 	ldap_data_handler.LdapClient = ldap.NewClient(ldap_config, mail_config, opts...)
 	if ldap_data_handler.LdapClient != nil {
 		return &ldap_data_handler
@@ -39,6 +72,7 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 	type AuthData struct {
 		UserName string `json:"username"`
 		Password string `json:"password"`
+		Client   string `json:"client"`
 	}
 	var auth_data = AuthData{}
 	if err := c.BindJSON(&auth_data); err != nil {
@@ -48,28 +82,112 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 		})
 		return
 	}
-	errauth := ldh.LdapClient.AuthenticateUser(auth_data.UserName, auth_data.Password)
+	user, errauth := ldh.LdapClient.AuthenticateUser(auth_data.UserName, auth_data.Password)
 	if errauth != nil {
-		c.JSON(map[string]any{
+		c.Status(401).JSON(map[string]any{
 			"status": "error",
 			"error":  errauth.Message,
 		})
 		return
 	}
-	auth_token := jwt.New(jwt.SigningMethodHS256)
-	auth_token_signed, errsign := auth_token.SignedString(ldh.JwtSignKey)
-	if errsign != nil {
-		c.JSON(map[string]any{
+	if user == nil {
+		c.Status(500).JSON(map[string]any{
 			"status": "error",
-			"error":  errsign.Error(),
+			"error":  "Cannot get user object from LDAP",
+		})
+		return
+	}
+
+	hash_fab := xxHash32.New(0)
+	timestamp_iss := time.Now().Format("2006-01-02T15:04:05Z07:00")
+	timestamp_exp_auth := time.Now().Add(time.Duration(time.Duration.Minutes(JWT_AUTH_VALIDITY_MINS))).Format("2006-01-02T15:04:05Z07:00")
+	timestamp_exp_refresh := time.Now().Add(time.Duration(time.Duration.Minutes(JWT_REFRESH_VALIDITY_MINS))).Format("2006-01-02T15:04:05Z07:00")
+	hash_fab.Write([]byte(timestamp_iss))
+	my_hostname := c.Request.URL.Host
+	hash_fab.Write([]byte(my_hostname))
+	hash_fab.Write([]byte(auth_data.UserName))
+	id := fmt.Sprintf("%X", hash_fab.Sum32())
+
+	jwt_auth_data := JwtAuthData{
+		ID:       id,
+		Issuer:   my_hostname,
+		Subject:  ldh.LdapConfig.MailDomain,
+		Audience: auth_data.Client,
+		ExpTime:  timestamp_exp_auth,
+		IssTime:  timestamp_iss,
+		IsAdmin:  user.DomainAdmin,
+	}
+	jwt_auth_data_bytes, erra := json.Marshal(jwt_auth_data)
+	if erra != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot marshal JwtAuthData object",
+		})
+		return
+	}
+	var jwt_auth_data_map map[string]any
+	erram := json.Unmarshal(jwt_auth_data_bytes, &jwt_auth_data_map)
+	if erram != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot unmarshal JwtAuthData object",
+		})
+		return
+	}
+
+	jwt_refresh_data := JwtRefrData{
+		ID:       id,
+		Issuer:   my_hostname,
+		Subject:  JWT_REFRESH_SUBJECT,
+		Audience: auth_data.Client,
+		ExpTime:  timestamp_exp_refresh,
+		IssTime:  timestamp_iss,
+	}
+	jwt_refresh_data_bytes, errr := json.Marshal(jwt_refresh_data)
+	if errr != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot marshal JwtRefrData object",
+		})
+		return
+	}
+	var jwt_refresh_data_map map[string]any
+	errrm := json.Unmarshal(jwt_refresh_data_bytes, &jwt_refresh_data_map)
+	if errrm != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot unmarshal JwtRefrData object",
+		})
+		return
+	}
+
+	auth_token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(jwt_auth_data_map))
+	auth_token_signed, errsigna := auth_token.SignedString(ldh.JwtSignKey)
+	if errsigna != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  errsigna.Error(),
 		})
 		return
 	}
 	ldh.AuthTokens = append(ldh.AuthTokens, auth_token_signed)
-	c.JSON(map[string]any{
-		"status":     "success",
-		"auth-token": auth_token_signed,
-	})
+
+	refresh_token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(jwt_refresh_data_map))
+	refresh_token_signed, errsignr := refresh_token.SignedString(ldh.JwtSignKey)
+	if errsignr != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  errsignr.Error(),
+		})
+		return
+	}
+	ldh.RefreshTokens = append(ldh.RefreshTokens, refresh_token_signed)
+
+	jwt_response := JwtResponse{
+		JwtAuthToken:    auth_token_signed,
+		JwtRefreshToken: refresh_token_signed,
+	}
+	c.JSON(jwt_response)
 }
 
 func (ldh *LdapDataHandler) UsersHandler(c *gofsen.Context) {
