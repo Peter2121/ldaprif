@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -25,23 +26,12 @@ type LdapDataHandler struct {
 }
 
 type JwtAuthData struct {
-	ID       string `json:"jti"`
-	Issuer   string `json:"iss"`
-	Subject  string `json:"sub"`
-	Audience string `json:"aud"`
-	ExpTime  string `json:"exp"`
-	IssTime  string `json:"iat"`
-	Scope    string `json:"sco"`
-	IsAdmin  string `json:"iad"`
+	IsAdmin string `json:"iad,omitempty"`
+	jwt.RegisteredClaims
 }
 
 type JwtRefrData struct {
-	ID       string `json:"jti"`
-	Issuer   string `json:"iss"`
-	Subject  string `json:"sub"`
-	Audience string `json:"aud"`
-	ExpTime  string `json:"exp"`
-	IssTime  string `json:"iat"`
+	jwt.RegisteredClaims
 }
 
 type JwtResponse struct {
@@ -49,9 +39,22 @@ type JwtResponse struct {
 	JwtRefreshToken string `json:"refresh_token"`
 }
 
+func (m JwtAuthData) Validate() error {
+	if strings.ToUpper(m.IsAdmin) != "YES" {
+		return fmt.Errorf("Must be domain admin")
+	}
+	return nil
+}
+
 const JWT_AUTH_VALIDITY_MINS = 20
 const JWT_REFRESH_VALIDITY_MINS = 1440
 const JWT_REFRESH_SUBJECT string = "Refresh"
+
+const WEB_CLIENT string = "web"
+const MOBILE_CLIENT string = "mobile"
+const DESKTOP_CLIENT string = "desktop"
+
+var CLIENTS = []string{WEB_CLIENT, MOBILE_CLIENT, DESKTOP_CLIENT}
 
 func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, jsik []byte, opts ...ldap.ClientOption) *LdapDataHandler {
 	ldap_data_handler := LdapDataHandler{}
@@ -97,71 +100,22 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 		})
 		return
 	}
-
-	hash_fab := xxHash32.New(0)
-	timestamp_iss := time.Now().Format("2006-01-02T15:04:05Z07:00")
-	timestamp_exp_auth := time.Now().Add(time.Duration(time.Duration.Minutes(JWT_AUTH_VALIDITY_MINS))).Format("2006-01-02T15:04:05Z07:00")
-	timestamp_exp_refresh := time.Now().Add(time.Duration(time.Duration.Minutes(JWT_REFRESH_VALIDITY_MINS))).Format("2006-01-02T15:04:05Z07:00")
-	hash_fab.Write([]byte(timestamp_iss))
-	my_hostname := c.Request.URL.Host
-	hash_fab.Write([]byte(my_hostname))
-	hash_fab.Write([]byte(auth_data.UserName))
-	id := fmt.Sprintf("%X", hash_fab.Sum32())
-
-	jwt_auth_data := JwtAuthData{
-		ID:       id,
-		Issuer:   my_hostname,
-		Subject:  ldh.LdapConfig.MailDomain,
-		Audience: auth_data.Client,
-		ExpTime:  timestamp_exp_auth,
-		IssTime:  timestamp_iss,
-		IsAdmin:  user.DomainAdmin,
-	}
-	jwt_auth_data_bytes, erra := json.Marshal(jwt_auth_data)
-	if erra != nil {
+	auth_token, refresh_token, strerrtok := GetTokens(c.Request.URL.Host, auth_data.UserName, ldh.LdapConfig.MailDomain, auth_data.Client, user.DomainAdmin)
+	if len(strerrtok) > 0 {
 		c.Status(500).JSON(map[string]any{
 			"status": "error",
-			"error":  "Cannot marshal JwtAuthData object",
+			"error":  strerrtok,
 		})
 		return
 	}
-	var jwt_auth_data_map map[string]any
-	erram := json.Unmarshal(jwt_auth_data_bytes, &jwt_auth_data_map)
-	if erram != nil {
+	if (auth_token == nil) || (refresh_token == nil) {
 		c.Status(500).JSON(map[string]any{
 			"status": "error",
-			"error":  "Cannot unmarshal JwtAuthData object",
+			"error":  "Cannot get authentication tokens",
 		})
 		return
 	}
 
-	jwt_refresh_data := JwtRefrData{
-		ID:       id,
-		Issuer:   my_hostname,
-		Subject:  JWT_REFRESH_SUBJECT,
-		Audience: auth_data.Client,
-		ExpTime:  timestamp_exp_refresh,
-		IssTime:  timestamp_iss,
-	}
-	jwt_refresh_data_bytes, errr := json.Marshal(jwt_refresh_data)
-	if errr != nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot marshal JwtRefrData object",
-		})
-		return
-	}
-	var jwt_refresh_data_map map[string]any
-	errrm := json.Unmarshal(jwt_refresh_data_bytes, &jwt_refresh_data_map)
-	if errrm != nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot unmarshal JwtRefrData object",
-		})
-		return
-	}
-
-	auth_token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(jwt_auth_data_map))
 	auth_token_signed, errsigna := auth_token.SignedString(ldh.JwtSignKey)
 	if errsigna != nil {
 		c.Status(500).JSON(map[string]any{
@@ -172,7 +126,6 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 	}
 	ldh.AuthTokens = append(ldh.AuthTokens, auth_token_signed)
 
-	refresh_token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(jwt_refresh_data_map))
 	refresh_token_signed, errsignr := refresh_token.SignedString(ldh.JwtSignKey)
 	if errsignr != nil {
 		c.Status(500).JSON(map[string]any{
@@ -188,6 +141,225 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 		JwtRefreshToken: refresh_token_signed,
 	}
 	c.JSON(jwt_response)
+}
+
+func (ldh *LdapDataHandler) ReAuthHandler(c *gofsen.Context) {
+	type ReAuthData struct {
+		RefreshToken string `json:"refresh_token"`
+		Client       string `json:"client"`
+	}
+	var reauth_data = ReAuthData{}
+	if err := c.BindJSON(&reauth_data); err != nil {
+		c.Status(400).JSON(map[string]any{
+			"status": "error",
+			"error":  "Invalid JSON",
+		})
+		return
+	}
+
+	refresh_token_string := reauth_data.RefreshToken
+	if len(refresh_token_string) == 0 {
+		c.Status(400).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot get reauthentication token from data sent",
+		})
+	}
+
+	ok, claims := ldh.ValidateReAuthToken(c, refresh_token_string)
+	if (!ok) || (claims == nil) {
+		c.Status(400).JSON(map[string]any{
+			"status": "error",
+			"error":  "Invalid refresh token",
+		})
+		return
+	}
+
+	auth_token, refresh_token, strerrtok := GetTokens(c.Request.URL.Host, claims.Audience[1], ldh.LdapConfig.MailDomain, claims.Audience[0], claims.IsAdmin)
+	if len(strerrtok) > 0 {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  strerrtok,
+		})
+		return
+	}
+	if (auth_token == nil) || (refresh_token == nil) {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot get authentication tokens",
+		})
+		return
+	}
+
+	auth_token_signed, errsigna := auth_token.SignedString(ldh.JwtSignKey)
+	if errsigna != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  errsigna.Error(),
+		})
+		return
+	}
+	ldh.AuthTokens = append(ldh.AuthTokens, auth_token_signed)
+
+	refresh_token_signed, errsignr := refresh_token.SignedString(ldh.JwtSignKey)
+	if errsignr != nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  errsignr.Error(),
+		})
+		return
+	}
+	ldh.RefreshTokens = append(ldh.RefreshTokens, refresh_token_signed)
+
+	jwt_response := JwtResponse{
+		JwtAuthToken:    auth_token_signed,
+		JwtRefreshToken: refresh_token_signed,
+	}
+	c.JSON(jwt_response)
+}
+
+func (ldh *LdapDataHandler) ValidateReAuthToken(c *gofsen.Context, reauth_token_string string) (bool, *JwtAuthData) {
+	claims := jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(
+		reauth_token_string,
+		&claims,
+		func(token *jwt.Token) (any, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			}
+			return ldh.JwtSignKey, nil
+		},
+		jwt.WithIssuedAt(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}),
+		jwt.WithLeeway(1*time.Minute),
+		jwt.WithAudience(CLIENTS...),
+		jwt.WithIssuer(c.Request.URL.Host),
+		jwt.WithSubject(JWT_REFRESH_SUBJECT),
+	)
+	if err != nil {
+		log.Printf("Error parsing token: %v", err)
+		return false, nil
+	}
+
+	if !token.Valid {
+		log.Printf("Token is invalid")
+		return false, nil
+	}
+
+	if len(claims.Audience) < 2 {
+		log.Printf("No username in refresh token audience claim")
+		return false, nil
+	}
+
+	username := claims.Audience[1]
+	if len(username) == 0 {
+		log.Printf("Empty username in refresh token audience claim")
+		return false, nil
+	}
+	var user *ldap.User
+	var erru *errors.Error
+
+	if strings.Contains(username, "@") {
+		user, erru = ldh.LdapClient.Users.GetByEmail(username)
+	} else {
+		user, erru = ldh.LdapClient.Users.GetByUid(username)
+	}
+
+	if erru != nil {
+		log.Printf("Cannot find user %s in LDAP: %v", username, erru)
+		return false, nil
+	}
+
+	if strings.ToUpper(user.DomainAdmin) != "YES" {
+		log.Printf("User %s iis not admin", username)
+		return false, nil
+	}
+
+	ret_claims := JwtAuthData{user.DomainAdmin, claims}
+	return true, &ret_claims
+}
+
+func (ldh *LdapDataHandler) ValidateAuthToken(c *gofsen.Context, auth_token_string string) bool {
+	claims := JwtAuthData{}
+	token, err := jwt.ParseWithClaims(
+		auth_token_string,
+		&claims,
+		func(token *jwt.Token) (any, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			}
+			return ldh.JwtSignKey, nil
+		},
+		jwt.WithIssuedAt(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}),
+		jwt.WithLeeway(1*time.Minute),
+		jwt.WithAudience(CLIENTS...),
+		jwt.WithIssuer(c.Request.URL.Host),
+		jwt.WithSubject(ldh.LdapConfig.MailDomain),
+	)
+	if err != nil {
+		log.Printf("Error parsing token: %v", err)
+		return false
+	}
+
+	if !token.Valid {
+		log.Printf("Token is invalid")
+		return false
+	}
+
+	// TODO: add support for non-admin tokens
+	/*
+		if strings.ToUpper(claims.IsAdmin) != "YES" {
+			...
+		}
+	*/
+	return true
+}
+
+func GetTokens(hostname, username, maildomain, client, isadmin string) (*jwt.Token, *jwt.Token, string) {
+	hash_fab := xxHash32.New(0)
+	timestamp_iss := time.Now()
+	timestamp_exp_auth := timestamp_iss.Add(time.Duration(time.Minute * JWT_AUTH_VALIDITY_MINS))
+	timestamp_exp_refresh := timestamp_iss.Add(time.Duration(time.Minute * JWT_REFRESH_VALIDITY_MINS))
+	timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * (JWT_AUTH_VALIDITY_MINS / 2)))
+	//timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * 2))
+	hash_fab.Write([]byte(timestamp_iss.Format("2006-01-02T15:04:05Z07:00")))
+	hash_fab.Write([]byte(hostname))
+	hash_fab.Write([]byte(username))
+	id := fmt.Sprintf("%X", hash_fab.Sum32())
+
+	//log.Printf("Issued: %v\n", *jwt.NewNumericDate(timestamp_iss))
+	//log.Printf("Expires: %v\n", *jwt.NewNumericDate(timestamp_exp_auth))
+	//log.Printf("Start refresh: %v\n", *jwt.NewNumericDate(timestamp_nbf_refresh))
+	//log.Printf("Expires refresh: %v\n", *jwt.NewNumericDate(timestamp_exp_refresh))
+
+	jwt_auth_data := JwtAuthData{
+		isadmin,
+		jwt.RegisteredClaims{
+			ID:        id,
+			Issuer:    hostname,
+			Subject:   maildomain,
+			Audience:  []string{client, username},
+			IssuedAt:  jwt.NewNumericDate(timestamp_iss),
+			ExpiresAt: jwt.NewNumericDate(timestamp_exp_auth),
+		},
+	}
+
+	jwt_refresh_data := JwtRefrData{
+		jwt.RegisteredClaims{
+			ID:        id,
+			Issuer:    hostname,
+			Subject:   JWT_REFRESH_SUBJECT,
+			Audience:  []string{client, username},
+			IssuedAt:  jwt.NewNumericDate(timestamp_iss),
+			ExpiresAt: jwt.NewNumericDate(timestamp_exp_refresh),
+			NotBefore: jwt.NewNumericDate(timestamp_nbf_refresh),
+		},
+	}
+
+	auth_token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt_auth_data)
+	refresh_token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt_refresh_data)
+
+	return auth_token, refresh_token, ""
 }
 
 func (ldh *LdapDataHandler) UsersHandler(c *gofsen.Context) {

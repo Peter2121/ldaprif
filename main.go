@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"main/handlers"
+	"main/middleware"
 	"os"
 
 	"github.com/Bakemono-san/gofsen"
@@ -93,12 +94,13 @@ func main() {
 
 	app.Use(gofsen.CORSWithConfig(corsConfig))
 
-	//app.Use(middleware.AuthMiddleware())
+	app.Use(middleware.AuthMiddleware(ldap_data_handler))
 
 	// Routes de base
 	app.GET("/", handlers.HomeHandler)
 	app.GET("/health", handlers.HealthHandler)
 	app.POST("/auth", ldap_data_handler.AuthHandler)
+	app.POST("/reauth", ldap_data_handler.ReAuthHandler)
 
 	// Groupes d'API
 	api := app.Group("/api/v1")
