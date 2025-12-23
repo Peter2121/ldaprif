@@ -28,6 +28,10 @@ func AuthMiddleware(ldh *handlers.LdapDataHandler) gofsen.MiddlewareFunc {
 
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 		*/
+		if c.Request.RequestURI == "/health" {
+			c.Next()
+			return
+		}
 		if (c.Request.RequestURI != "/auth") && (c.Request.RequestURI != "/reauth") {
 			token, err := request.BearerExtractor{}.ExtractToken(c.Request)
 			if err != nil {

@@ -16,6 +16,7 @@ import (
 
 var LdapConfigFileName = "ldap.conf.json"
 var MailConfigFileName = "mail.conf.json"
+var ConfigFilesPath []string = []string{"/usr/local/etc/", "./"}
 
 var JWT_KEY []byte
 
@@ -37,6 +38,16 @@ func ReadConfig[T ldap.ConfigLdap | ldap.ConfigMail](config_file_path string) (*
 	return &config, nil
 }
 
+func FindConfigFile(file_name string) string {
+	for _, path := range ConfigFilesPath {
+		full_path := path + file_name
+		if _, err := os.Stat(full_path); err == nil {
+			return full_path
+		}
+	}
+	return ""
+}
+
 func ReadConfigLdap(config_file_path string) (*ldap.ConfigLdap, error) {
 	return ReadConfig[ldap.ConfigLdap](config_file_path)
 }
@@ -47,25 +58,35 @@ func ReadConfigMail(config_file_path string) (*ldap.ConfigMail, error) {
 
 func main() {
 
-	ldap_config, errlc := ReadConfigLdap(LdapConfigFileName)
+	ldap_config_file := FindConfigFile(LdapConfigFileName)
+	if len(ldap_config_file) == 0 {
+		fmt.Printf("FATAL: Cannot find ldap configuration file %s\n", LdapConfigFileName)
+		return
+	}
+	fmt.Printf("Reading ldap configuration from file %s...\n", ldap_config_file)
+	ldap_config, errlc := ReadConfigLdap(ldap_config_file)
 	if errlc != nil {
 		fmt.Printf("FATAL: Cannot read ldap configuration file %s: %v\n", LdapConfigFileName, errlc)
 		return
 	}
-
 	if ldap_config == nil {
 		fmt.Printf("FATAL: Cannot read ldap configuration file %s\n", LdapConfigFileName)
 		return
 	}
 
-	mail_config, errmc := ReadConfigMail(MailConfigFileName)
-	if errmc != nil {
-		fmt.Printf("FATAL: Cannot mail configuration file %s: %v\n", MailConfigFileName, errmc)
+	mail_config_file := FindConfigFile(MailConfigFileName)
+	if len(mail_config_file) == 0 {
+		fmt.Printf("FATAL: Cannot find mail server configuration file %s\n", MailConfigFileName)
 		return
 	}
-
+	fmt.Printf("Reading mail server configuration from file %s...\n", mail_config_file)
+	mail_config, errmc := ReadConfigMail(mail_config_file)
+	if errmc != nil {
+		fmt.Printf("FATAL: Cannot mail server configuration file %s: %v\n", MailConfigFileName, errmc)
+		return
+	}
 	if mail_config == nil {
-		fmt.Printf("FATAL: Cannot read mail configuration file %s\n", MailConfigFileName)
+		fmt.Printf("FATAL: Cannot read mail server configuration file %s\n", MailConfigFileName)
 		return
 	}
 
@@ -77,7 +98,6 @@ func main() {
 		log.Printf("FATAL: Cannot create LDAP data handler")
 	}
 
-	// Créer une nouvelle instance Gofsen
 	app := gofsen.New()
 
 	// Middlewares globaux
@@ -121,7 +141,6 @@ func main() {
 	app.PrintRoutes()
 
 	// Démarrer le serveur
-	log.Printf("🚀 Serveur %s démarré sur http://localhost:8080", "ldaprif")
+	log.Printf("🚀 Serveur %s démarré sur le port 8080", "ldaprif")
 	app.Listen("8080")
-	//log.Printf("End")
 }
