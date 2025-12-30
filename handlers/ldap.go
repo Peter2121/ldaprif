@@ -17,9 +17,10 @@ import (
 )
 
 type LdapDataHandler struct {
-	LdapConfig    *ldap.ConfigLdap
-	MailConfig    *ldap.ConfigMail
-	LdapClient    *ldap.Client
+	LdapConfig *ldap.ConfigLdap
+	MailConfig *ldap.ConfigMail
+	Opts       []ldap.ClientOption
+	//LdapClient    *ldap.Client
 	JwtSignKey    []byte
 	AuthTokens    []string
 	RefreshTokens []string
@@ -60,15 +61,20 @@ func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMa
 	ldap_data_handler := LdapDataHandler{}
 	ldap_data_handler.LdapConfig = ldap_config
 	ldap_data_handler.MailConfig = mail_config
+	ldap_data_handler.Opts = opts
 	ldap_data_handler.JwtSignKey = jsik
 	ldap_data_handler.AuthTokens = make([]string, 0)
 	ldap_data_handler.RefreshTokens = make([]string, 0)
-	ldap_data_handler.LdapClient = ldap.NewClient(ldap_config, mail_config, opts...)
-	if ldap_data_handler.LdapClient != nil {
-		return &ldap_data_handler
-	} else {
-		return nil
-	}
+	return &ldap_data_handler
+	//ldap_data_handler.LdapClient = nil
+	/*
+		ldap_data_handler.LdapClient = ldap.NewClient(ldap_config, mail_config, opts...)
+		if ldap_data_handler.LdapClient != nil {
+			return &ldap_data_handler
+		} else {
+			return nil
+		}
+	*/
 }
 
 func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
@@ -85,7 +91,15 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 		})
 		return
 	}
-	user, errauth := ldh.LdapClient.AuthenticateUser(auth_data.UserName, auth_data.Password)
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
+	user, errauth := ldap_client.AuthenticateUser(auth_data.UserName, auth_data.Password)
 	if errauth != nil {
 		c.Status(401).JSON(map[string]any{
 			"status": "error",
@@ -258,10 +272,16 @@ func (ldh *LdapDataHandler) ValidateReAuthToken(c *gofsen.Context, reauth_token_
 	var user *ldap.User
 	var erru *errors.Error
 
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		log.Printf("Cannot create LDAP client")
+		return false, nil
+	}
+
 	if strings.Contains(username, "@") {
-		user, erru = ldh.LdapClient.Users.GetByEmail(username)
+		user, erru = ldap_client.Users.GetByEmail(username)
 	} else {
-		user, erru = ldh.LdapClient.Users.GetByUid(username)
+		user, erru = ldap_client.Users.GetByUid(username)
 	}
 
 	if erru != nil {
@@ -270,7 +290,7 @@ func (ldh *LdapDataHandler) ValidateReAuthToken(c *gofsen.Context, reauth_token_
 	}
 
 	if strings.ToUpper(user.DomainAdmin) != "YES" {
-		log.Printf("User %s iis not admin", username)
+		log.Printf("User %s is not admin", username)
 		return false, nil
 	}
 
@@ -363,7 +383,16 @@ func GetTokens(hostname, username, maildomain, client, isadmin string) (*jwt.Tok
 }
 
 func (ldh *LdapDataHandler) UsersHandler(c *gofsen.Context) {
-	users, _ := ldh.LdapClient.Users.GetAll()
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"api":    "v1",
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
+	users, _ := ldap_client.Users.GetAll()
 	c.JSON(users)
 }
 
@@ -372,12 +401,21 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 	var err *errors.Error
 	uid := c.Param("uid")
 	srch_by_mail := strings.Contains(uid, "@")
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"api":    "v1",
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
 	switch c.Request.Method {
 	case "GET":
 		if srch_by_mail {
-			user, err = ldh.LdapClient.Users.GetByEmail(uid)
+			user, err = ldap_client.Users.GetByEmail(uid)
 		} else {
-			user, err = ldh.LdapClient.Users.GetByUid(uid)
+			user, err = ldap_client.Users.GetByUid(uid)
 		}
 		if err == nil {
 			if user != nil {
@@ -392,9 +430,9 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 		}
 	case "PUT":
 		if srch_by_mail {
-			user_old, err = ldh.LdapClient.Users.GetByEmail(uid)
+			user_old, err = ldap_client.Users.GetByEmail(uid)
 		} else {
-			user_old, err = ldh.LdapClient.Users.GetByUid(uid)
+			user_old, err = ldap_client.Users.GetByUid(uid)
 		}
 		// TODO: manage user creation if user is not found
 		if err != nil {
@@ -419,7 +457,7 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 			})
 			return
 		}
-		errmod := ldh.LdapClient.Users.ModifyUser(*user, *user_old)
+		errmod := ldap_client.Users.ModifyUser(*user, *user_old)
 		if errmod != nil {
 			c.Status(400).JSON(map[string]any{
 				"api":    "v1",
@@ -428,7 +466,7 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 			})
 			return
 		}
-		user_mod, errum := ldh.LdapClient.Users.GetByEmail(user.Mail)
+		user_mod, errum := ldap_client.Users.GetByEmail(user.Mail)
 		if (errum == nil) && (user_mod != nil) {
 			c.JSON(user_mod)
 			return
@@ -449,9 +487,9 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 		}
 	case "DELETE":
 		if srch_by_mail {
-			err = ldh.LdapClient.Users.DeleteByEmail(uid)
+			err = ldap_client.Users.DeleteByEmail(uid)
 		} else {
-			err = ldh.LdapClient.Users.DeleteByUid(uid)
+			err = ldap_client.Users.DeleteByUid(uid)
 		}
 		if err == nil {
 			c.Status(204)
@@ -463,7 +501,6 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 			})
 		}
 	}
-
 }
 
 func (ldh *LdapDataHandler) CreateUserHandler(c *gofsen.Context) {
@@ -476,7 +513,15 @@ func (ldh *LdapDataHandler) CreateUserHandler(c *gofsen.Context) {
 		})
 		return
 	}
-	errc := ldh.LdapClient.Users.Create(user)
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
+	errc := ldap_client.Users.Create(user)
 	if errc == nil {
 		c.Status(201).JSON(user)
 	} else {
@@ -491,8 +536,15 @@ func (ldh *LdapDataHandler) CreateUserHandler(c *gofsen.Context) {
 func (ldh *LdapDataHandler) GroupsHandler(c *gofsen.Context) {
 	var have_gss bool = false
 	var have_gsm bool = false
-
-	groupss, _ := ldh.LdapClient.GroupsSec.GetAll()
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
+	groupss, _ := ldap_client.GroupsSec.GetAll()
 	if len(groupss) > 0 {
 		have_gss = true
 	}
@@ -501,7 +553,7 @@ func (ldh *LdapDataHandler) GroupsHandler(c *gofsen.Context) {
 			fmt.Printf("Security Group: %s\n", group.Cn)
 		}
 	*/
-	groupsm, _ := ldh.LdapClient.GroupsMail.GetAll()
+	groupsm, _ := ldap_client.GroupsMail.GetAll()
 	if len(groupsm) > 0 {
 		have_gsm = true
 	}
@@ -553,19 +605,27 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 
 	var group_mail *ldap.GroupMail = nil
 	var errgm *errors.Error = nil
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
 	switch c.Request.Method {
 	case "GET":
 		if !srch_by_mail {
-			group_sec, errgs := ldh.LdapClient.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+			group_sec, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
 			if (errgs == nil) && (group_sec != nil) {
 				c.JSON(group_sec)
 				return
 			}
 		}
 		if srch_by_mail {
-			group_mail, errgm = ldh.LdapClient.GroupsMail.GetOne(ldap.MailAttr, gid, "")
+			group_mail, errgm = ldap_client.GroupsMail.GetOne(ldap.MailAttr, gid, "")
 		} else {
-			group_mail, errgm = ldh.LdapClient.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+			group_mail, errgm = ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
 		}
 		if errgm == nil {
 			if group_mail != nil {
@@ -581,7 +641,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 	case "PUT":
 		var group_sec *ldap.GroupSec = nil
 		if !srch_by_mail {
-			group_old, errgs := ldh.LdapClient.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+			group_old, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
 			if (errgs == nil) && (group_old != nil) {
 				if err := c.BindJSON(&group_sec); err != nil {
 					c.Status(400).JSON(map[string]any{
@@ -591,7 +651,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 					})
 					return
 				}
-				errmod := ldh.LdapClient.GroupsSec.ModifyGroup(*group_sec, *group_old)
+				errmod := ldap_client.GroupsSec.ModifyGroup(*group_sec, *group_old)
 				if errmod != nil {
 					c.Status(400).JSON(map[string]any{
 						"api":    "v1",
@@ -600,7 +660,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 					})
 					return
 				}
-				group_mod, errgsm := ldh.LdapClient.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+				group_mod, errgsm := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
 				if (errgsm == nil) && (group_mod != nil) {
 					c.JSON(group_mod)
 					return
@@ -620,7 +680,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 					return
 				}
 			} else {
-				group_old, errgs := ldh.LdapClient.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+				group_old, errgs := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
 				if (errgs == nil) && (group_old != nil) {
 					if err := c.BindJSON(&group_mail); err != nil {
 						c.Status(400).JSON(map[string]any{
@@ -630,7 +690,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 						})
 						return
 					}
-					errmod := ldh.LdapClient.GroupsMail.ModifyGroup(*group_mail, *group_old)
+					errmod := ldap_client.GroupsMail.ModifyGroup(*group_mail, *group_old)
 					if errmod != nil {
 						c.Status(400).JSON(map[string]any{
 							"api":    "v1",
@@ -639,7 +699,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 						})
 						return
 					}
-					group_mod, errgsm := ldh.LdapClient.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+					group_mod, errgsm := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
 					if (errgsm == nil) && (group_mod != nil) {
 						c.JSON(group_mod)
 						return
@@ -687,16 +747,16 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 						})
 						return
 					}
-					ldh.CreateGroup(c, body_bytes, group_type)
+					ldh.CreateGroup(c, body_bytes, group_type, ldap_client)
 				}
 			}
 		}
 	case "DELETE":
 		var errdel *errors.Error = nil
 		if srch_by_mail {
-			group_mail, errgm = ldh.LdapClient.GroupsMail.GetOne(ldap.MailAttr, gid, "")
+			group_mail, errgm = ldap_client.GroupsMail.GetOne(ldap.MailAttr, gid, "")
 			if (errgm == nil) && (group_mail != nil) {
-				errdel = ldh.LdapClient.GroupsMail.Delete(group_mail.Cn, "")
+				errdel = ldap_client.GroupsMail.Delete(group_mail.Cn, "")
 				if errdel != nil {
 					c.JSON(map[string]any{
 						"api":    "v1",
@@ -715,16 +775,16 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 			}
 		} else {
 			var errfin string
-			gm, errgm := ldh.LdapClient.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+			gm, errgm := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
 			if (errgm == nil) && (gm != nil) {
-				errdel = ldh.LdapClient.GroupsMail.Delete(gm.Cn, "")
+				errdel = ldap_client.GroupsMail.Delete(gm.Cn, "")
 				if errdel == nil {
 					c.Status(204)
 				}
 			}
-			gs, errgs := ldh.LdapClient.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+			gs, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
 			if (errgs == nil) && (gs != nil) {
-				errdel = ldh.LdapClient.GroupsMail.Delete(gs.Cn, gs.Ou)
+				errdel = ldap_client.GroupsMail.Delete(gs.Cn, gs.Ou)
 				if errdel == nil {
 					c.Status(204)
 				}
@@ -777,10 +837,18 @@ func (ldh *LdapDataHandler) CreateGroupHandler(c *gofsen.Context) {
 		})
 		return
 	}
-	ldh.CreateGroup(c, body_bytes, group_type)
+	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
+	if ldap_client == nil {
+		c.Status(500).JSON(map[string]any{
+			"status": "error",
+			"error":  "Cannot create LDAP client",
+		})
+		return
+	}
+	ldh.CreateGroup(c, body_bytes, group_type, ldap_client)
 }
 
-func (ldh *LdapDataHandler) CreateGroup(c *gofsen.Context, body_bytes []byte, group_type string) {
+func (ldh *LdapDataHandler) CreateGroup(c *gofsen.Context, body_bytes []byte, group_type string, ldap_client *ldap.Client) {
 	switch group_type {
 	case ldap.GROUP_TYPES[0]: // "Mail"
 		var group ldap.GroupMail
@@ -792,7 +860,7 @@ func (ldh *LdapDataHandler) CreateGroup(c *gofsen.Context, body_bytes []byte, gr
 			})
 			return
 		}
-		errc := ldh.LdapClient.GroupsMail.CreateGroup(group)
+		errc := ldap_client.GroupsMail.CreateGroup(group)
 		if errc == nil {
 			c.Status(201).JSON(group)
 		} else {
@@ -812,7 +880,7 @@ func (ldh *LdapDataHandler) CreateGroup(c *gofsen.Context, body_bytes []byte, gr
 			})
 			return
 		}
-		errc := ldh.LdapClient.GroupsSec.CreateGroup(group)
+		errc := ldap_client.GroupsSec.CreateGroup(group)
 		if errc == nil {
 			c.Status(201).JSON(group)
 		} else {
