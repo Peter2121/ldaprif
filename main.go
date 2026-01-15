@@ -8,7 +8,9 @@ import (
 	"log"
 	"main/handlers"
 	"main/middleware"
+	"main/types"
 	"os"
+	"strconv"
 
 	"github.com/Bakemono-san/gofsen"
 	"github.com/peter2121/ldap-mcli/ldap"
@@ -16,13 +18,24 @@ import (
 
 var LdapConfigFileName = "ldap.conf.json"
 var MailConfigFileName = "mail.conf.json"
-var ConfigFilesPath []string = []string{"/usr/local/etc/", "./"}
+var AppConfigFileName = "app.conf.json"
+var ConfigFilesPath []string = []string{"./", "/usr/local/etc/ldaprif/", "/etc/ldaprif/"}
 
 var JWT_KEY []byte
 
-const JWT_KEY_LENGTH int = 64
+//const JWT_KEY_LENGTH int = 64
 
-func ReadConfig[T ldap.ConfigLdap | ldap.ConfigMail](config_file_path string) (*T, error) {
+/*
+type ConfigApp struct {
+	JwtKeyLength       int      `json:"jwt_key_length"`
+	JwtAuthValidity    int      `json:"jwt_auth_validity"`
+	JwtRefreshValidity int      `json:"jwt_refresh_validity"`
+	WebPort            int      `json:"web_port"`
+	CorsAllowOrigins   []string `json:"cors_allow_origins"`
+}
+*/
+
+func ReadConfig[T ldap.ConfigLdap | ldap.ConfigMail | types.ConfigApp](config_file_path string) (*T, error) {
 	config_file, err := os.Open(config_file_path)
 	if err != nil {
 		return nil, err
@@ -56,6 +69,10 @@ func ReadConfigMail(config_file_path string) (*ldap.ConfigMail, error) {
 	return ReadConfig[ldap.ConfigMail](config_file_path)
 }
 
+func ReadConfigApp(config_file_path string) (*types.ConfigApp, error) {
+	return ReadConfig[types.ConfigApp](config_file_path)
+}
+
 func main() {
 
 	ldap_config_file := FindConfigFile(LdapConfigFileName)
@@ -82,7 +99,7 @@ func main() {
 	fmt.Printf("Reading mail server configuration from file %s...\n", mail_config_file)
 	mail_config, errmc := ReadConfigMail(mail_config_file)
 	if errmc != nil {
-		fmt.Printf("FATAL: Cannot mail server configuration file %s: %v\n", MailConfigFileName, errmc)
+		fmt.Printf("FATAL: Cannot read mail server configuration file %s: %v\n", MailConfigFileName, errmc)
 		return
 	}
 	if mail_config == nil {
@@ -90,12 +107,29 @@ func main() {
 		return
 	}
 
-	JWT_KEY = make([]byte, JWT_KEY_LENGTH)
+	app_config_file := FindConfigFile(AppConfigFileName)
+	if len(app_config_file) == 0 {
+		fmt.Printf("FATAL: Cannot find application configuration file %s\n", AppConfigFileName)
+		return
+	}
+	fmt.Printf("Reading application configuration from file %s...\n", app_config_file)
+	app_config, errac := ReadConfigApp(app_config_file)
+	if errac != nil {
+		fmt.Printf("FATAL: Cannot read application configuration file %s: %v\n", AppConfigFileName, errac)
+		return
+	}
+	if app_config == nil {
+		fmt.Printf("FATAL: Cannot read application configuration file %s\n", AppConfigFileName)
+		return
+	}
+
+	JWT_KEY = make([]byte, app_config.JwtKeyLength)
 	rand.Read(JWT_KEY)
 
-	ldap_data_handler := handlers.NewLdapDataHandler(ldap_config, mail_config, JWT_KEY)
+	ldap_data_handler := handlers.NewLdapDataHandler(ldap_config, mail_config, app_config, JWT_KEY)
 	if ldap_data_handler == nil {
 		log.Printf("FATAL: Cannot create LDAP data handler")
+		return
 	}
 
 	app := gofsen.New()
@@ -107,7 +141,8 @@ func main() {
 	corsConfig := gofsen.CORSConfig{
 		//AllowOrigins: []string{"*"},
 		//AllowMethods: []string{"*"},
-		AllowOrigins: []string{"http://localhost:5173", "http://localhost:8080"},
+		//AllowOrigins: []string{"http://localhost:5173", "http://localhost:8080"},
+		AllowOrigins: app_config.CorsAllowOrigins,
 		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders: []string{"Content-Type", "Authorization"},
 	}
@@ -140,7 +175,15 @@ func main() {
 	// Afficher les routes
 	app.PrintRoutes()
 
+	if (app_config.WebPort < 1) || (app_config.WebPort > 65535) {
+		log.Printf("FATAL: Invalid web port in application configuration: %d", app_config.WebPort)
+		return
+	}
+	port_str := strconv.Itoa(app_config.WebPort)
+	if len(port_str) == 0 {
+		log.Printf("FATAL: Invalid web port in application configuration: %d", app_config.WebPort)
+	}
 	// Démarrer le serveur
-	log.Printf("🚀 Serveur %s démarré sur le port 8080", "ldaprif")
-	app.Listen("8080")
+	log.Printf("🚀 Server %s is starting on port %s...", "ldaprif", port_str)
+	app.Listen(port_str)
 }

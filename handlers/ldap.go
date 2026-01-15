@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"main/types"
+
 	"github.com/Bakemono-san/gofsen"
 	"github.com/atselvan/go-utils/utils/errors"
 	"github.com/atselvan/go-utils/utils/slice"
@@ -19,6 +21,7 @@ import (
 type LdapDataHandler struct {
 	LdapConfig *ldap.ConfigLdap
 	MailConfig *ldap.ConfigMail
+	AppConfig  *types.ConfigApp
 	Opts       []ldap.ClientOption
 	//LdapClient    *ldap.Client
 	JwtSignKey    []byte
@@ -47,8 +50,8 @@ func (m JwtAuthData) Validate() error {
 	return nil
 }
 
-const JWT_AUTH_VALIDITY_MINS = 20
-const JWT_REFRESH_VALIDITY_MINS = 1440
+// const JWT_AUTH_VALIDITY_MINS = 20
+// const JWT_REFRESH_VALIDITY_MINS = 1440
 const JWT_REFRESH_SUBJECT string = "Refresh"
 
 const WEB_CLIENT string = "web"
@@ -57,10 +60,11 @@ const DESKTOP_CLIENT string = "desktop"
 
 var CLIENTS = []string{WEB_CLIENT, MOBILE_CLIENT, DESKTOP_CLIENT}
 
-func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, jsik []byte, opts ...ldap.ClientOption) *LdapDataHandler {
+func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMail, app_config *types.ConfigApp, jsik []byte, opts ...ldap.ClientOption) *LdapDataHandler {
 	ldap_data_handler := LdapDataHandler{}
 	ldap_data_handler.LdapConfig = ldap_config
 	ldap_data_handler.MailConfig = mail_config
+	ldap_data_handler.AppConfig = app_config
 	ldap_data_handler.Opts = opts
 	ldap_data_handler.JwtSignKey = jsik
 	ldap_data_handler.AuthTokens = make([]string, 0)
@@ -114,7 +118,7 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 		})
 		return
 	}
-	auth_token, refresh_token, strerrtok := GetTokens(c.Request.URL.Host, auth_data.UserName, ldh.LdapConfig.MailDomain, auth_data.Client, user.DomainAdmin)
+	auth_token, refresh_token, strerrtok := ldh.GetTokens(c.Request.URL.Host, auth_data.UserName, ldh.LdapConfig.MailDomain, auth_data.Client, user.DomainAdmin)
 	if len(strerrtok) > 0 {
 		c.Status(500).JSON(map[string]any{
 			"status": "error",
@@ -188,7 +192,7 @@ func (ldh *LdapDataHandler) ReAuthHandler(c *gofsen.Context) {
 		return
 	}
 
-	auth_token, refresh_token, strerrtok := GetTokens(c.Request.URL.Host, claims.Audience[1], ldh.LdapConfig.MailDomain, claims.Audience[0], claims.IsAdmin)
+	auth_token, refresh_token, strerrtok := ldh.GetTokens(c.Request.URL.Host, claims.Audience[1], ldh.LdapConfig.MailDomain, claims.Audience[0], claims.IsAdmin)
 	if len(strerrtok) > 0 {
 		c.Status(500).JSON(map[string]any{
 			"status": "error",
@@ -335,12 +339,12 @@ func (ldh *LdapDataHandler) ValidateAuthToken(c *gofsen.Context, auth_token_stri
 	return true
 }
 
-func GetTokens(hostname, username, maildomain, client, isadmin string) (*jwt.Token, *jwt.Token, string) {
+func (ldh *LdapDataHandler) GetTokens(hostname, username, maildomain, client, isadmin string) (*jwt.Token, *jwt.Token, string) {
 	hash_fab := xxHash32.New(0)
 	timestamp_iss := time.Now()
-	timestamp_exp_auth := timestamp_iss.Add(time.Duration(time.Minute * JWT_AUTH_VALIDITY_MINS))
-	timestamp_exp_refresh := timestamp_iss.Add(time.Duration(time.Minute * JWT_REFRESH_VALIDITY_MINS))
-	timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * (JWT_AUTH_VALIDITY_MINS / 2)))
+	timestamp_exp_auth := timestamp_iss.Add(time.Duration(time.Minute * time.Duration(ldh.AppConfig.JwtAuthValidity)))
+	timestamp_exp_refresh := timestamp_iss.Add(time.Duration(time.Minute * time.Duration(ldh.AppConfig.JwtRefreshValidity)))
+	timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * time.Duration(ldh.AppConfig.JwtAuthValidity/2)))
 	//timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * 2))
 	hash_fab.Write([]byte(timestamp_iss.Format("2006-01-02T15:04:05Z07:00")))
 	hash_fab.Write([]byte(hostname))
