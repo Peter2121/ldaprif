@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,6 +18,14 @@ import (
 	"github.com/peter2121/ldap-mcli/ldap"
 	"github.com/pierrec/xxHash/xxHash32"
 )
+
+const MAX_LEN_USERNAME int = 128
+const MAX_LEN_PASSWORD int = 128
+
+const EMAIL_VALIDATION_REGEX string = `^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`
+const CN_VALIDATION_REGEX string = `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`
+
+const AUTH_ERROR string = "Invalid credentials"
 
 type LdapDataHandler struct {
 	LdapConfig *ldap.ConfigLdap
@@ -95,6 +104,35 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 		})
 		return
 	}
+	if (len(auth_data.UserName) > MAX_LEN_USERNAME) || (len(auth_data.Password) > MAX_LEN_PASSWORD) {
+		c.Status(401).JSON(map[string]any{
+			"status": "error",
+			"error":  AUTH_ERROR,
+		})
+		return
+	}
+
+	email_regex := regexp.MustCompile(EMAIL_VALIDATION_REGEX)
+	cn_regex := regexp.MustCompile(CN_VALIDATION_REGEX)
+
+	if strings.Contains(auth_data.UserName, "@") {
+		if !email_regex.MatchString(auth_data.UserName) {
+			c.Status(401).JSON(map[string]any{
+				"status": "error",
+				"error":  AUTH_ERROR,
+			})
+			return
+		}
+	} else {
+		if !cn_regex.MatchString(auth_data.UserName) {
+			c.Status(401).JSON(map[string]any{
+				"status": "error",
+				"error":  AUTH_ERROR,
+			})
+			return
+		}
+	}
+
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
 		c.Status(500).JSON(map[string]any{
@@ -107,7 +145,7 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 	if errauth != nil {
 		c.Status(401).JSON(map[string]any{
 			"status": "error",
-			"error":  errauth.Message,
+			"error":  AUTH_ERROR,
 		})
 		return
 	}
