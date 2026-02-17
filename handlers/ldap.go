@@ -826,7 +826,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 			}
 			gs, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
 			if (errgs == nil) && (gs != nil) {
-				errdel = ldap_client.GroupsMail.Delete(gs.Cn, gs.Ou)
+				errdel = ldap_client.GroupsSec.Delete(gs.Cn, gs.Ou)
 				if errdel == nil {
 					c.Status(204)
 				}
