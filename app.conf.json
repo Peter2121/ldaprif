@@ -1,6 +1,6 @@
 {
     "jwt_key_length": 64,
-    "jwt_auth_validity": 20, 
+    "jwt_auth_validity": 20,
     "jwt_refresh_validity": 1440,
     "web_port": 8080,
     "cors_allow_origins": [
@@ -8,5 +8,9 @@
         "http://localhost:8080",
         "http://192.168.1.194:8080",
         "https://192.168.1.206"
-    ]
+    ],
+    "tls_cert_file": "",
+    "tls_key_file": "",
+    "auth_max_failures": 10,
+    "auth_lockout_minutes": 15
 }

@@ -9,12 +9,17 @@ import (
 	"main/handlers"
 	"main/middleware"
 	"main/types"
+	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/Bakemono-san/gofsen"
 	"github.com/peter2121/ldap-mcli/ldap"
 )
+
+const MIN_JWT_KEY_LENGTH int = 32    // bytes of HMAC key
+const MAX_BODY_BYTES int64 = 1 << 20 // 1 MiB request body
 
 var LdapConfigFileName = "ldap.conf.json"
 var MailConfigFileName = "mail.conf.json"
@@ -123,8 +128,20 @@ func main() {
 		return
 	}
 
+	// An empty or short HMAC key makes every token forgeable
+	if app_config.JwtKeyLength < MIN_JWT_KEY_LENGTH {
+		log.Printf("FATAL: jwt_key_length must be at least %d bytes (got %d)", MIN_JWT_KEY_LENGTH, app_config.JwtKeyLength)
+		return
+	}
+	if (app_config.JwtAuthValidity < 1) || (app_config.JwtRefreshValidity < 1) {
+		log.Printf("FATAL: jwt_auth_validity and jwt_refresh_validity must be positive minutes")
+		return
+	}
 	JWT_KEY = make([]byte, app_config.JwtKeyLength)
-	rand.Read(JWT_KEY)
+	if _, err := rand.Read(JWT_KEY); err != nil {
+		log.Printf("FATAL: Cannot generate JWT signing key: %v", err)
+		return
+	}
 
 	ldap_data_handler := handlers.NewLdapDataHandler(ldap_config, mail_config, app_config, JWT_KEY)
 	if ldap_data_handler == nil {
@@ -149,6 +166,7 @@ func main() {
 
 	app.Use(gofsen.CORSWithConfig(corsConfig))
 
+	app.Use(middleware.BodyLimit(MAX_BODY_BYTES))
 	app.Use(middleware.AuthMiddleware(ldap_data_handler))
 
 	// Routes de base
@@ -180,10 +198,27 @@ func main() {
 		return
 	}
 	port_str := strconv.Itoa(app_config.WebPort)
-	if len(port_str) == 0 {
-		log.Printf("FATAL: Invalid web port in application configuration: %d", app_config.WebPort)
+
+	// Timeouts protect against slow clients holding connections open
+	server := &http.Server{
+		Addr:              ":" + port_str,
+		Handler:           app,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+
 	// Démarrer le serveur
-	log.Printf("🚀 Server %s is starting on port %s...", "ldaprif", port_str)
-	app.Listen(port_str)
+	var errsrv error
+	if (app_config.TlsCertFile != "") && (app_config.TlsKeyFile != "") {
+		log.Printf("🚀 Server %s is starting on port %s (HTTPS)...", "ldaprif", port_str)
+		errsrv = server.ListenAndServeTLS(app_config.TlsCertFile, app_config.TlsKeyFile)
+	} else {
+		log.Printf("🚀 Server %s is starting on port %s (plain HTTP: put it behind a TLS reverse proxy)...", "ldaprif", port_str)
+		errsrv = server.ListenAndServe()
+	}
+	if errsrv != nil {
+		log.Printf("FATAL: %v", errsrv)
+	}
 }
