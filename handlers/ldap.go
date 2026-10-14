@@ -1,12 +1,17 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"main/types"
@@ -16,7 +21,6 @@ import (
 	"github.com/atselvan/go-utils/utils/slice"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/peter2121/ldap-mcli/ldap"
-	"github.com/pierrec/xxHash/xxHash32"
 )
 
 const MAX_LEN_USERNAME int = 128
@@ -26,16 +30,29 @@ const EMAIL_VALIDATION_REGEX string = `^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-
 const CN_VALIDATION_REGEX string = `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`
 
 const AUTH_ERROR string = "Invalid credentials"
+const ADMIN_ERROR string = "Must be domain admin"
+const LOCKOUT_ERROR string = "Too many failed login attempts, try again later"
+const LDAP_ERROR string = "LDAP operation failed"
+
+const DEFAULT_AUTH_MAX_FAILURES int = 10
+const DEFAULT_AUTH_LOCKOUT_MINUTES int = 15
 
 type LdapDataHandler struct {
 	LdapConfig *ldap.ConfigLdap
 	MailConfig *ldap.ConfigMail
 	AppConfig  *types.ConfigApp
 	Opts       []ldap.ClientOption
-	//LdapClient    *ldap.Client
-	JwtSignKey    []byte
-	AuthTokens    []string
-	RefreshTokens []string
+	JwtSignKey []byte
+
+	mu           sync.Mutex
+	usedRefresh  map[string]time.Time    // refresh tokens already exchanged (single use) -> their expiry
+	authFailures map[string]*authFailure // failed logins per client IP and per username
+}
+
+type authFailure struct {
+	count       int
+	lastFailure time.Time
+	lockedUntil time.Time
 }
 
 type JwtAuthData struct {
@@ -52,15 +69,14 @@ type JwtResponse struct {
 	JwtRefreshToken string `json:"refresh_token"`
 }
 
+// Validate is called by jwt.ParseWithClaims: an auth token is only valid for a domain admin.
 func (m JwtAuthData) Validate() error {
-	if strings.ToUpper(m.IsAdmin) != "YES" {
-		return fmt.Errorf("Must be domain admin")
+	if !isAdmin(m.IsAdmin) {
+		return fmt.Errorf("%s", ADMIN_ERROR)
 	}
 	return nil
 }
 
-// const JWT_AUTH_VALIDITY_MINS = 20
-// const JWT_REFRESH_VALIDITY_MINS = 1440
 const JWT_REFRESH_SUBJECT string = "Refresh"
 
 const WEB_CLIENT string = "web"
@@ -76,19 +92,143 @@ func NewLdapDataHandler(ldap_config *ldap.ConfigLdap, mail_config *ldap.ConfigMa
 	ldap_data_handler.AppConfig = app_config
 	ldap_data_handler.Opts = opts
 	ldap_data_handler.JwtSignKey = jsik
-	ldap_data_handler.AuthTokens = make([]string, 0)
-	ldap_data_handler.RefreshTokens = make([]string, 0)
+	ldap_data_handler.usedRefresh = make(map[string]time.Time)
+	ldap_data_handler.authFailures = make(map[string]*authFailure)
 	return &ldap_data_handler
-	//ldap_data_handler.LdapClient = nil
-	/*
-		ldap_data_handler.LdapClient = ldap.NewClient(ldap_config, mail_config, opts...)
-		if ldap_data_handler.LdapClient != nil {
-			return &ldap_data_handler
-		} else {
-			return nil
-		}
-	*/
 }
+
+// Helpers
+
+func isAdmin(flag string) bool {
+	return strings.ToUpper(flag) == "YES"
+}
+
+// apiError sends a JSON error with the given HTTP status (single response per request).
+func apiError(c *gofsen.Context, status int, message string) {
+	c.Status(status).JSON(map[string]any{
+		"api":    "v1",
+		"status": "error",
+		"error":  message,
+	})
+}
+
+// apiLdapError maps a ldap-mcli error to an HTTP response. Internal errors (5xx) are logged and
+// replaced by a generic message: LDAP result codes, DNs or hostnames never reach the client.
+func apiLdapError(c *gofsen.Context, err *errors.Error) {
+	status := err.Status
+	if status < 400 || status > 599 {
+		status = http.StatusInternalServerError
+	}
+	message := err.Message
+	if status >= 500 {
+		log.Printf("LDAP error on %s %s: %s", c.Request.Method, c.Request.URL.Path, err.Message)
+		message = LDAP_ERROR
+	}
+	apiError(c, status, message)
+}
+
+// clientIP returns the peer address. X-Forwarded-For is deliberately ignored: it is client-controlled
+// unless a trusted reverse proxy is configured.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func randomID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// Login throttling
+
+func (ldh *LdapDataHandler) authLimits() (int, time.Duration) {
+	max_failures := ldh.AppConfig.AuthMaxFailures
+	if max_failures <= 0 {
+		max_failures = DEFAULT_AUTH_MAX_FAILURES
+	}
+	lockout_minutes := ldh.AppConfig.AuthLockoutMinutes
+	if lockout_minutes <= 0 {
+		lockout_minutes = DEFAULT_AUTH_LOCKOUT_MINUTES
+	}
+	return max_failures, time.Duration(lockout_minutes) * time.Minute
+}
+
+// authLocked reports whether one of the keys (client IP, username) is currently locked out.
+func (ldh *LdapDataHandler) authLocked(keys ...string) bool {
+	ldh.mu.Lock()
+	defer ldh.mu.Unlock()
+	now := time.Now()
+	for _, k := range keys {
+		if f, ok := ldh.authFailures[k]; ok && now.Before(f.lockedUntil) {
+			return true
+		}
+	}
+	return false
+}
+
+// authFailed records a failed login; AuthMaxFailures within the lockout window locks the key.
+func (ldh *LdapDataHandler) authFailed(keys ...string) {
+	max_failures, window := ldh.authLimits()
+	ldh.mu.Lock()
+	defer ldh.mu.Unlock()
+	now := time.Now()
+	if len(ldh.authFailures) > 10000 { // bound memory: drop stale entries
+		for k, f := range ldh.authFailures {
+			if now.Sub(f.lastFailure) > window && now.After(f.lockedUntil) {
+				delete(ldh.authFailures, k)
+			}
+		}
+	}
+	for _, k := range keys {
+		f := ldh.authFailures[k]
+		if f == nil || now.Sub(f.lastFailure) > window {
+			f = &authFailure{}
+			ldh.authFailures[k] = f
+		}
+		f.count++
+		f.lastFailure = now
+		if f.count >= max_failures {
+			f.lockedUntil = now.Add(window)
+		}
+	}
+}
+
+func (ldh *LdapDataHandler) authSucceeded(keys ...string) {
+	ldh.mu.Lock()
+	defer ldh.mu.Unlock()
+	for _, k := range keys {
+		delete(ldh.authFailures, k)
+	}
+}
+
+// Refresh tokens are single use
+
+func (ldh *LdapDataHandler) refreshUsed(token string) bool {
+	ldh.mu.Lock()
+	defer ldh.mu.Unlock()
+	_, used := ldh.usedRefresh[token]
+	return used
+}
+
+func (ldh *LdapDataHandler) markRefreshUsed(token string, expiry time.Time) {
+	ldh.mu.Lock()
+	defer ldh.mu.Unlock()
+	now := time.Now()
+	for t, exp := range ldh.usedRefresh { // expired tokens are rejected by the parser anyway
+		if now.After(exp) {
+			delete(ldh.usedRefresh, t)
+		}
+	}
+	ldh.usedRefresh[token] = expiry
+}
+
+// Handlers
 
 func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 	type AuthData struct {
@@ -98,17 +238,15 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 	}
 	var auth_data = AuthData{}
 	if err := c.BindJSON(&auth_data); err != nil {
-		c.Status(400).JSON(map[string]any{
-			"status": "error",
-			"error":  "Invalid JSON",
-		})
+		apiError(c, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
-	if (len(auth_data.UserName) > MAX_LEN_USERNAME) || (len(auth_data.Password) > MAX_LEN_PASSWORD) {
-		c.Status(401).JSON(map[string]any{
-			"status": "error",
-			"error":  AUTH_ERROR,
-		})
+	if (len(auth_data.UserName) > MAX_LEN_USERNAME) || (len(auth_data.Password) > MAX_LEN_PASSWORD) || (len(auth_data.Password) == 0) {
+		apiError(c, http.StatusUnauthorized, AUTH_ERROR)
+		return
+	}
+	if !slice.EntryExists(CLIENTS, auth_data.Client) {
+		apiError(c, http.StatusBadRequest, "Invalid client")
 		return
 	}
 
@@ -117,86 +255,42 @@ func (ldh *LdapDataHandler) AuthHandler(c *gofsen.Context) {
 
 	if strings.Contains(auth_data.UserName, "@") {
 		if !email_regex.MatchString(auth_data.UserName) {
-			c.Status(401).JSON(map[string]any{
-				"status": "error",
-				"error":  AUTH_ERROR,
-			})
+			apiError(c, http.StatusUnauthorized, AUTH_ERROR)
 			return
 		}
 	} else {
 		if !cn_regex.MatchString(auth_data.UserName) {
-			c.Status(401).JSON(map[string]any{
-				"status": "error",
-				"error":  AUTH_ERROR,
-			})
+			apiError(c, http.StatusUnauthorized, AUTH_ERROR)
 			return
 		}
 	}
 
+	ip_key := "ip:" + clientIP(c.Request)
+	user_key := "user:" + strings.ToLower(auth_data.UserName)
+	if ldh.authLocked(ip_key, user_key) {
+		apiError(c, http.StatusTooManyRequests, LOCKOUT_ERROR)
+		return
+	}
+
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
 	user, errauth := ldap_client.AuthenticateUser(auth_data.UserName, auth_data.Password)
-	if errauth != nil {
-		c.Status(401).JSON(map[string]any{
-			"status": "error",
-			"error":  AUTH_ERROR,
-		})
+	if errauth != nil || user == nil {
+		ldh.authFailed(ip_key, user_key)
+		apiError(c, http.StatusUnauthorized, AUTH_ERROR)
 		return
 	}
-	if user == nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot get user object from LDAP",
-		})
-		return
-	}
-	auth_token, refresh_token, strerrtok := ldh.GetTokens(c.Request.URL.Host, auth_data.UserName, ldh.LdapConfig.MailDomain, auth_data.Client, user.DomainAdmin)
-	if len(strerrtok) > 0 {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  strerrtok,
-		})
-		return
-	}
-	if (auth_token == nil) || (refresh_token == nil) {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot get authentication tokens",
-		})
-		return
-	}
+	ldh.authSucceeded(ip_key, user_key)
 
-	auth_token_signed, errsigna := auth_token.SignedString(ldh.JwtSignKey)
-	if errsigna != nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  errsigna.Error(),
-		})
+	// Tokens are only issued to domain admins: a non-admin token would be rejected on every call
+	if !isAdmin(user.DomainAdmin) {
+		apiError(c, http.StatusForbidden, ADMIN_ERROR)
 		return
 	}
-	ldh.AuthTokens = append(ldh.AuthTokens, auth_token_signed)
-
-	refresh_token_signed, errsignr := refresh_token.SignedString(ldh.JwtSignKey)
-	if errsignr != nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  errsignr.Error(),
-		})
-		return
-	}
-	ldh.RefreshTokens = append(ldh.RefreshTokens, refresh_token_signed)
-
-	jwt_response := JwtResponse{
-		JwtAuthToken:    auth_token_signed,
-		JwtRefreshToken: refresh_token_signed,
-	}
-	c.JSON(jwt_response)
+	ldh.issueTokens(c, auth_data.UserName, auth_data.Client, user.DomainAdmin)
 }
 
 func (ldh *LdapDataHandler) ReAuthHandler(c *gofsen.Context) {
@@ -206,81 +300,76 @@ func (ldh *LdapDataHandler) ReAuthHandler(c *gofsen.Context) {
 	}
 	var reauth_data = ReAuthData{}
 	if err := c.BindJSON(&reauth_data); err != nil {
-		c.Status(400).JSON(map[string]any{
-			"status": "error",
-			"error":  "Invalid JSON",
-		})
+		apiError(c, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	refresh_token_string := reauth_data.RefreshToken
 	if len(refresh_token_string) == 0 {
-		c.Status(400).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot get reauthentication token from data sent",
-		})
+		apiError(c, http.StatusBadRequest, "Cannot get reauthentication token from data sent")
+		return
 	}
 
 	ok, claims := ldh.ValidateReAuthToken(c, refresh_token_string)
 	if (!ok) || (claims == nil) {
-		c.Status(400).JSON(map[string]any{
-			"status": "error",
-			"error":  "Invalid refresh token",
-		})
+		apiError(c, http.StatusUnauthorized, "Invalid refresh token")
 		return
 	}
 
-	auth_token, refresh_token, strerrtok := ldh.GetTokens(c.Request.URL.Host, claims.Audience[1], ldh.LdapConfig.MailDomain, claims.Audience[0], claims.IsAdmin)
+	// Single use: a stolen refresh token cannot be replayed once the legitimate client used it
+	expiry := time.Now()
+	if claims.ExpiresAt != nil {
+		expiry = claims.ExpiresAt.Time
+	}
+	ldh.markRefreshUsed(refresh_token_string, expiry)
+
+	ldh.issueTokens(c, claims.Audience[1], claims.Audience[0], claims.IsAdmin)
+}
+
+// issueTokens signs and returns a new auth/refresh token pair.
+func (ldh *LdapDataHandler) issueTokens(c *gofsen.Context, username, client, isadmin string) {
+	auth_token, refresh_token, strerrtok := ldh.GetTokens(c.Request.Host, username, ldh.LdapConfig.MailDomain, client, isadmin)
 	if len(strerrtok) > 0 {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  strerrtok,
-		})
+		log.Printf("Cannot build tokens for %s: %s", username, strerrtok)
+		apiError(c, http.StatusInternalServerError, "Cannot get authentication tokens")
 		return
 	}
 	if (auth_token == nil) || (refresh_token == nil) {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot get authentication tokens",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot get authentication tokens")
 		return
 	}
 
 	auth_token_signed, errsigna := auth_token.SignedString(ldh.JwtSignKey)
 	if errsigna != nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  errsigna.Error(),
-		})
+		log.Printf("Cannot sign auth token: %v", errsigna)
+		apiError(c, http.StatusInternalServerError, "Cannot sign authentication tokens")
 		return
 	}
-	ldh.AuthTokens = append(ldh.AuthTokens, auth_token_signed)
-
 	refresh_token_signed, errsignr := refresh_token.SignedString(ldh.JwtSignKey)
 	if errsignr != nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  errsignr.Error(),
-		})
+		log.Printf("Cannot sign refresh token: %v", errsignr)
+		apiError(c, http.StatusInternalServerError, "Cannot sign authentication tokens")
 		return
 	}
-	ldh.RefreshTokens = append(ldh.RefreshTokens, refresh_token_signed)
 
-	jwt_response := JwtResponse{
+	c.JSON(JwtResponse{
 		JwtAuthToken:    auth_token_signed,
 		JwtRefreshToken: refresh_token_signed,
-	}
-	c.JSON(jwt_response)
+	})
 }
 
 func (ldh *LdapDataHandler) ValidateReAuthToken(c *gofsen.Context, reauth_token_string string) (bool, *JwtAuthData) {
+	if ldh.refreshUsed(reauth_token_string) {
+		log.Printf("Refresh token replay rejected")
+		return false, nil
+	}
 	claims := jwt.RegisteredClaims{}
 	token, err := jwt.ParseWithClaims(
 		reauth_token_string,
 		&claims,
 		func(token *jwt.Token) (any, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 			}
 			return ldh.JwtSignKey, nil
 		},
@@ -288,7 +377,7 @@ func (ldh *LdapDataHandler) ValidateReAuthToken(c *gofsen.Context, reauth_token_
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}),
 		jwt.WithLeeway(1*time.Minute),
 		jwt.WithAudience(CLIENTS...),
-		jwt.WithIssuer(c.Request.URL.Host),
+		jwt.WithIssuer(c.Request.Host),
 		jwt.WithSubject(JWT_REFRESH_SUBJECT),
 	)
 	if err != nil {
@@ -320,18 +409,19 @@ func (ldh *LdapDataHandler) ValidateReAuthToken(c *gofsen.Context, reauth_token_
 		return false, nil
 	}
 
+	// The admin status is re-read from LDAP: a demoted admin cannot keep refreshing
 	if strings.Contains(username, "@") {
 		user, erru = ldap_client.Users.GetByEmail(username)
 	} else {
 		user, erru = ldap_client.Users.GetByUid(username)
 	}
 
-	if erru != nil {
+	if erru != nil || user == nil {
 		log.Printf("Cannot find user %s in LDAP: %v", username, erru)
 		return false, nil
 	}
 
-	if strings.ToUpper(user.DomainAdmin) != "YES" {
+	if !isAdmin(user.DomainAdmin) {
 		log.Printf("User %s is not admin", username)
 		return false, nil
 	}
@@ -347,7 +437,7 @@ func (ldh *LdapDataHandler) ValidateAuthToken(c *gofsen.Context, auth_token_stri
 		&claims,
 		func(token *jwt.Token) (any, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 			}
 			return ldh.JwtSignKey, nil
 		},
@@ -355,7 +445,7 @@ func (ldh *LdapDataHandler) ValidateAuthToken(c *gofsen.Context, auth_token_stri
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}),
 		jwt.WithLeeway(1*time.Minute),
 		jwt.WithAudience(CLIENTS...),
-		jwt.WithIssuer(c.Request.URL.Host),
+		jwt.WithIssuer(c.Request.Host),
 		jwt.WithSubject(ldh.LdapConfig.MailDomain),
 	)
 	if err != nil {
@@ -368,31 +458,23 @@ func (ldh *LdapDataHandler) ValidateAuthToken(c *gofsen.Context, auth_token_stri
 		return false
 	}
 
-	// TODO: add support for non-admin tokens
-	/*
-		if strings.ToUpper(claims.IsAdmin) != "YES" {
-			...
-		}
-	*/
+	// Explicit on top of JwtAuthData.Validate(): the API is admin-only
+	if !isAdmin(claims.IsAdmin) {
+		log.Printf("Token is not an admin token")
+		return false
+	}
 	return true
 }
 
 func (ldh *LdapDataHandler) GetTokens(hostname, username, maildomain, client, isadmin string) (*jwt.Token, *jwt.Token, string) {
-	hash_fab := xxHash32.New(0)
+	id, errid := randomID()
+	if errid != nil {
+		return nil, nil, "Cannot generate token id"
+	}
 	timestamp_iss := time.Now()
 	timestamp_exp_auth := timestamp_iss.Add(time.Duration(time.Minute * time.Duration(ldh.AppConfig.JwtAuthValidity)))
 	timestamp_exp_refresh := timestamp_iss.Add(time.Duration(time.Minute * time.Duration(ldh.AppConfig.JwtRefreshValidity)))
 	timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * time.Duration(ldh.AppConfig.JwtAuthValidity/2)))
-	//timestamp_nbf_refresh := timestamp_iss.Add(time.Duration(time.Minute * 2))
-	hash_fab.Write([]byte(timestamp_iss.Format("2006-01-02T15:04:05Z07:00")))
-	hash_fab.Write([]byte(hostname))
-	hash_fab.Write([]byte(username))
-	id := fmt.Sprintf("%X", hash_fab.Sum32())
-
-	//log.Printf("Issued: %v\n", *jwt.NewNumericDate(timestamp_iss))
-	//log.Printf("Expires: %v\n", *jwt.NewNumericDate(timestamp_exp_auth))
-	//log.Printf("Start refresh: %v\n", *jwt.NewNumericDate(timestamp_nbf_refresh))
-	//log.Printf("Expires refresh: %v\n", *jwt.NewNumericDate(timestamp_exp_refresh))
 
 	jwt_auth_data := JwtAuthData{
 		isadmin,
@@ -427,14 +509,14 @@ func (ldh *LdapDataHandler) GetTokens(hostname, username, maildomain, client, is
 func (ldh *LdapDataHandler) UsersHandler(c *gofsen.Context) {
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
-	users, _ := ldap_client.Users.GetAll()
+	users, err := ldap_client.Users.GetAll()
+	if err != nil {
+		apiLdapError(c, err)
+		return
+	}
 	c.JSON(users)
 }
 
@@ -445,11 +527,7 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 	srch_by_mail := strings.Contains(uid, "@")
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
 	switch c.Request.Method {
@@ -459,186 +537,115 @@ func (ldh *LdapDataHandler) UserHandler(c *gofsen.Context) {
 		} else {
 			user, err = ldap_client.Users.GetByUid(uid)
 		}
-		if err == nil {
-			if user != nil {
-				c.JSON(user)
-			}
-		} else {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  err.Message,
-			})
+		if err != nil {
+			apiLdapError(c, err)
+			return
 		}
+		if user == nil {
+			apiError(c, http.StatusNotFound, "User not found")
+			return
+		}
+		c.JSON(user)
 	case "PUT":
 		if srch_by_mail {
 			user_old, err = ldap_client.Users.GetByEmail(uid)
 		} else {
 			user_old, err = ldap_client.Users.GetByUid(uid)
 		}
-		// TODO: manage user creation if user is not found
 		if err != nil {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  err.Message,
-			})
+			apiLdapError(c, err)
+			return
 		}
 		if user_old == nil {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  "Cannot find existing user to modify",
-			})
-		}
-		if err := c.BindJSON(&user); err != nil {
-			c.Status(400).JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  "Invalid JSON",
-			})
+			apiError(c, http.StatusNotFound, "Cannot find existing user to modify")
 			return
 		}
-		errmod := ldap_client.Users.ModifyUser(*user, *user_old)
+		var user_new ldap.User
+		if err := c.BindJSON(&user_new); err != nil {
+			apiError(c, http.StatusBadRequest, "Invalid JSON")
+			return
+		}
+		// mail is immutable and identifies the entry to modify: the body cannot retarget another user
+		if user_new.Mail == "" {
+			user_new.Mail = user_old.Mail
+		} else if user_new.Mail != user_old.Mail {
+			apiError(c, http.StatusBadRequest, "mail cannot be changed")
+			return
+		}
+		errmod := ldap_client.Users.ModifyUser(user_new, *user_old)
 		if errmod != nil {
-			c.Status(400).JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  errmod.Message,
-			})
+			apiLdapError(c, errmod)
 			return
 		}
-		user_mod, errum := ldap_client.Users.GetByEmail(user.Mail)
-		if (errum == nil) && (user_mod != nil) {
-			c.JSON(user_mod)
-			return
-		} else if errum != nil {
-			c.Status(400).JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  errum.Message,
-			})
-			return
-		} else {
-			c.Status(400).JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  "Cannot get modified user from LDAP",
-			})
+		user_mod, errum := ldap_client.Users.GetByEmail(user_old.Mail)
+		if errum != nil {
+			apiLdapError(c, errum)
 			return
 		}
+		if user_mod == nil {
+			apiError(c, http.StatusInternalServerError, "Cannot get modified user from LDAP")
+			return
+		}
+		c.JSON(user_mod)
 	case "DELETE":
 		if srch_by_mail {
 			err = ldap_client.Users.DeleteByEmail(uid)
 		} else {
 			err = ldap_client.Users.DeleteByUid(uid)
 		}
-		if err == nil {
-			c.Status(204)
-		} else {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  err.Message,
-			})
+		if err != nil {
+			apiLdapError(c, err)
+			return
 		}
+		c.Status(http.StatusNoContent)
 	}
 }
 
 func (ldh *LdapDataHandler) CreateUserHandler(c *gofsen.Context) {
 	var user ldap.User
 	if err := c.BindJSON(&user); err != nil {
-		c.Status(400).JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  "Invalid JSON",
-		})
+		apiError(c, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
 	errc := ldap_client.Users.Create(user)
-	if errc == nil {
-		c.Status(201).JSON(user)
-	} else {
-		c.JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  errc.Message,
-		})
+	if errc != nil {
+		apiLdapError(c, errc)
+		return
 	}
+	user.UserPassword = "" // never echo the password back
+	c.Status(http.StatusCreated).JSON(user)
 }
 
 func (ldh *LdapDataHandler) GroupsHandler(c *gofsen.Context) {
-	var have_gss bool = false
-	var have_gsm bool = false
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
-	groupss, _ := ldap_client.GroupsSec.GetAll()
-	if len(groupss) > 0 {
-		have_gss = true
+	// A missing group subtree (404) is an empty list, any other failure is an error
+	groupss, errgs := ldap_client.GroupsSec.GetAll()
+	if errgs != nil && errgs.Status != http.StatusNotFound {
+		apiLdapError(c, errgs)
+		return
 	}
-	/*
-		for _, group := range groupss {
-			fmt.Printf("Security Group: %s\n", group.Cn)
-		}
-	*/
-	groupsm, _ := ldap_client.GroupsMail.GetAll()
-	if len(groupsm) > 0 {
-		have_gsm = true
+	groupsm, errgm := ldap_client.GroupsMail.GetAll()
+	if errgm != nil && errgm.Status != http.StatusNotFound {
+		apiLdapError(c, errgm)
+		return
 	}
-	/*
-		for _, group := range groupsm {
-			fmt.Printf("Distribution Group: %s (%s)\n", group.Cn, group.Mail)
-		}
-	*/
-	var str_gss string = ""
-	var str_gsm string = ""
-
-	if have_gss {
-		byte_gss, err_gss := json.Marshal(groupss)
-		if err_gss == nil {
-			str_gss = strings.Trim(string(byte_gss), "[]")
-		}
+	result := make([]any, 0, len(groupss)+len(groupsm))
+	for _, g := range groupss {
+		result = append(result, g)
 	}
-
-	if have_gsm {
-		byte_gsm, err_gsm := json.Marshal(groupsm)
-		if err_gsm == nil {
-			str_gsm = strings.Trim(string(byte_gsm), "[]")
-		}
+	for _, g := range groupsm {
+		result = append(result, g)
 	}
-
-	var result string = "[ "
-	if len(str_gss) > 0 {
-		result = result + str_gss
-		if len(str_gsm) > 0 {
-			result = result + ", " + str_gsm
-		}
-	} else {
-		result = result + str_gsm
-	}
-	result = result + " ]"
-
-	var jres []map[string]any
-	erruj := json.Unmarshal([]byte(result), &jres)
-	if erruj == nil {
-		c.JSON(jres)
-	} else {
-		fmt.Printf("Error unmarshaling concatenated result: %v\n", erruj)
-	}
+	c.JSON(result)
 }
 
 func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
@@ -649,10 +656,7 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 	var errgm *errors.Error = nil
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
 	switch c.Request.Method {
@@ -669,222 +673,154 @@ func (ldh *LdapDataHandler) GroupHandler(c *gofsen.Context) {
 		} else {
 			group_mail, errgm = ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
 		}
-		if errgm == nil {
-			if group_mail != nil {
-				c.JSON(group_mail)
-			}
-		} else {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  errgm.Message,
-			})
+		if errgm != nil {
+			apiLdapError(c, errgm)
+			return
 		}
+		if group_mail == nil {
+			apiError(c, http.StatusNotFound, "Group not found")
+			return
+		}
+		c.JSON(group_mail)
 	case "PUT":
 		var group_sec *ldap.GroupSec = nil
-		if !srch_by_mail {
-			group_old, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
-			if (errgs == nil) && (group_old != nil) {
-				if err := c.BindJSON(&group_sec); err != nil {
-					c.Status(400).JSON(map[string]any{
-						"api":    "v1",
-						"status": "error",
-						"error":  "Invalid JSON",
-					})
-					return
-				}
-				errmod := ldap_client.GroupsSec.ModifyGroup(*group_sec, *group_old)
-				if errmod != nil {
-					c.Status(400).JSON(map[string]any{
-						"api":    "v1",
-						"status": "error",
-						"error":  errmod.Message,
-					})
-					return
-				}
-				group_mod, errgsm := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
-				if (errgsm == nil) && (group_mod != nil) {
-					c.JSON(group_mod)
-					return
-				} else if errgsm != nil {
-					c.Status(400).JSON(map[string]any{
-						"api":    "v1",
-						"status": "error",
-						"error":  errgsm.Message,
-					})
-					return
-				} else {
-					c.Status(400).JSON(map[string]any{
-						"api":    "v1",
-						"status": "error",
-						"error":  "Cannot get modified group from LDAP",
-					})
-					return
-				}
-			} else {
-				group_old, errgs := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
-				if (errgs == nil) && (group_old != nil) {
-					if err := c.BindJSON(&group_mail); err != nil {
-						c.Status(400).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  "Invalid JSON",
-						})
-						return
-					}
-					errmod := ldap_client.GroupsMail.ModifyGroup(*group_mail, *group_old)
-					if errmod != nil {
-						c.Status(400).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  errmod.Message,
-						})
-						return
-					}
-					group_mod, errgsm := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
-					if (errgsm == nil) && (group_mod != nil) {
-						c.JSON(group_mod)
-						return
-					} else if errgsm != nil {
-						c.Status(400).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  errgsm.Message,
-						})
-						return
-					} else {
-						c.Status(400).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  "Cannot get modified group from LDAP",
-						})
-						return
-					}
-				} else {
-					// Not found, need to be created
-					var base_group ldap.BaseGroup
-					body_bytes, err := io.ReadAll(c.Request.Body)
-					if (err != nil) || (len(body_bytes) == 0) {
-						c.Status(500).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  "FATAL: cannot read request body",
-						})
-						return
-					}
-					if err := json.Unmarshal(body_bytes, &base_group); err != nil {
-						c.Status(400).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  "Invalid JSON: cannot be parsed to BaseGroup",
-						})
-						return
-					}
-					group_type := base_group.Type
-					if !slice.EntryExists(ldap.GROUP_TYPES, group_type) {
-						c.Status(400).JSON(map[string]any{
-							"api":    "v1",
-							"status": "error",
-							"error":  "Invalid JSON: invalid group type",
-						})
-						return
-					}
-					ldh.CreateGroup(c, body_bytes, group_type, ldap_client)
-				}
-			}
+		if srch_by_mail {
+			apiError(c, http.StatusBadRequest, "Groups are modified by cn, not by mail")
+			return
 		}
+		group_old, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+		if (errgs == nil) && (group_old != nil) {
+			if err := c.BindJSON(&group_sec); err != nil || group_sec == nil {
+				apiError(c, http.StatusBadRequest, "Invalid JSON")
+				return
+			}
+			errmod := ldap_client.GroupsSec.ModifyGroup(*group_sec, *group_old)
+			if errmod != nil {
+				apiLdapError(c, errmod)
+				return
+			}
+			group_mod, errgsm := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+			if errgsm != nil {
+				apiLdapError(c, errgsm)
+				return
+			}
+			if group_mod == nil {
+				apiError(c, http.StatusInternalServerError, "Cannot get modified group from LDAP")
+				return
+			}
+			c.JSON(group_mod)
+			return
+		}
+		group_mail_old, errgmo := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+		if (errgmo == nil) && (group_mail_old != nil) {
+			if err := c.BindJSON(&group_mail); err != nil || group_mail == nil {
+				apiError(c, http.StatusBadRequest, "Invalid JSON")
+				return
+			}
+			errmod := ldap_client.GroupsMail.ModifyGroup(*group_mail, *group_mail_old)
+			if errmod != nil {
+				apiLdapError(c, errmod)
+				return
+			}
+			group_mod, errgsm := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+			if errgsm != nil {
+				apiLdapError(c, errgsm)
+				return
+			}
+			if group_mod == nil {
+				apiError(c, http.StatusInternalServerError, "Cannot get modified group from LDAP")
+				return
+			}
+			c.JSON(group_mod)
+			return
+		}
+		// Not found, need to be created
+		body_bytes, group_type, ok := ldh.readGroupBody(c)
+		if !ok {
+			return
+		}
+		ldh.CreateGroup(c, body_bytes, group_type, ldap_client)
 	case "DELETE":
-		var errdel *errors.Error = nil
 		if srch_by_mail {
 			group_mail, errgm = ldap_client.GroupsMail.GetOne(ldap.MailAttr, gid, "")
-			if (errgm == nil) && (group_mail != nil) {
-				errdel = ldap_client.GroupsMail.Delete(group_mail.Cn, "")
-				if errdel != nil {
-					c.JSON(map[string]any{
-						"api":    "v1",
-						"status": "error",
-						"error":  errdel.Message,
-					})
-				} else {
-					c.Status(204)
-				}
-			} else {
-				c.JSON(map[string]any{
-					"api":    "v1",
-					"status": "error",
-					"error":  errgm.Message,
-				})
-			}
-		} else {
-			var errfin string
-			gm, errgm := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
-			if (errgm == nil) && (gm != nil) {
-				errdel = ldap_client.GroupsMail.Delete(gm.Cn, "")
-				if errdel == nil {
-					c.Status(204)
-				}
-			}
-			gs, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
-			if (errgs == nil) && (gs != nil) {
-				errdel = ldap_client.GroupsSec.Delete(gs.Cn, gs.Ou)
-				if errdel == nil {
-					c.Status(204)
-				}
-			}
 			if errgm != nil {
-				errfin = fmt.Sprintf("Error searching for Mail List Group %s=%s: %s", ldap.CommonNameAttr, gid, errgm.Message)
+				apiLdapError(c, errgm)
+				return
 			}
-			if errgs != nil {
-				errfin = fmt.Sprintf("%s Error searching for Security Group %s=%s: %s", errfin, ldap.CommonNameAttr, gid, errgs.Message)
+			if group_mail == nil {
+				apiError(c, http.StatusNotFound, "Group not found")
+				return
 			}
-			if errdel != nil {
-				errfin = fmt.Sprintf("%s Error deleting Group %s=%s: %s", errfin, ldap.CommonNameAttr, gid, errdel.Message)
+			if errdel := ldap_client.GroupsMail.Delete(group_mail.Cn, ""); errdel != nil {
+				apiLdapError(c, errdel)
+				return
 			}
-			if errfin != "" {
-				c.JSON(map[string]any{
-					"api":    "v1",
-					"status": "error",
-					"error":  errfin,
-				})
-			}
+			c.Status(http.StatusNoContent)
+			return
 		}
+		// By cn: both the mail list and the security group with that cn are deleted
+		deleted := 0
+		gm, errgm := ldap_client.GroupsMail.GetOne(ldap.CommonNameAttr, gid, "")
+		if (errgm == nil) && (gm != nil) {
+			if errdel := ldap_client.GroupsMail.Delete(gm.Cn, ""); errdel != nil {
+				apiLdapError(c, errdel)
+				return
+			}
+			deleted++
+		} else if errgm != nil && errgm.Status != http.StatusNotFound {
+			apiLdapError(c, errgm)
+			return
+		}
+		gs, errgs := ldap_client.GroupsSec.GetOne(ldap.CommonNameAttr, gid, "")
+		if (errgs == nil) && (gs != nil) {
+			if errdel := ldap_client.GroupsSec.Delete(gs.Cn, gs.Ou); errdel != nil {
+				apiLdapError(c, errdel)
+				return
+			}
+			deleted++
+		} else if errgs != nil && errgs.Status != http.StatusNotFound {
+			apiLdapError(c, errgs)
+			return
+		}
+		if deleted == 0 {
+			apiError(c, http.StatusNotFound, "Group not found")
+			return
+		}
+		c.Status(http.StatusNoContent)
 	}
 }
 
-func (ldh *LdapDataHandler) CreateGroupHandler(c *gofsen.Context) {
+// readGroupBody reads the request body and extracts a valid group type from it.
+func (ldh *LdapDataHandler) readGroupBody(c *gofsen.Context) ([]byte, string, bool) {
 	var base_group ldap.BaseGroup
 	body_bytes, err := io.ReadAll(c.Request.Body)
-	if (err != nil) || (len(body_bytes) == 0) {
-		c.Status(500).JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  "FATAL: cannot read request body",
-		})
-		return
+	if err != nil {
+		apiError(c, http.StatusBadRequest, "Cannot read request body")
+		return nil, "", false
+	}
+	if len(body_bytes) == 0 {
+		apiError(c, http.StatusBadRequest, "Empty request body")
+		return nil, "", false
 	}
 	if err := json.Unmarshal(body_bytes, &base_group); err != nil {
-		c.Status(400).JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  "Invalid JSON: cannot be parsed to BaseGroup",
-		})
-		return
+		apiError(c, http.StatusBadRequest, "Invalid JSON: cannot be parsed to BaseGroup")
+		return nil, "", false
 	}
-	group_type := base_group.Type
-	if !slice.EntryExists(ldap.GROUP_TYPES, group_type) {
-		c.Status(400).JSON(map[string]any{
-			"api":    "v1",
-			"status": "error",
-			"error":  "Invalid JSON: invalid group type",
-		})
+	if !slice.EntryExists(ldap.GROUP_TYPES, base_group.Type) {
+		apiError(c, http.StatusBadRequest, "Invalid JSON: invalid group type")
+		return nil, "", false
+	}
+	return body_bytes, base_group.Type, true
+}
+
+func (ldh *LdapDataHandler) CreateGroupHandler(c *gofsen.Context) {
+	body_bytes, group_type, ok := ldh.readGroupBody(c)
+	if !ok {
 		return
 	}
 	ldap_client := ldap.NewClient(ldh.LdapConfig, ldh.MailConfig, ldh.Opts...)
 	if ldap_client == nil {
-		c.Status(500).JSON(map[string]any{
-			"status": "error",
-			"error":  "Cannot create LDAP client",
-		})
+		apiError(c, http.StatusInternalServerError, "Cannot create LDAP client")
 		return
 	}
 	ldh.CreateGroup(c, body_bytes, group_type, ldap_client)
@@ -895,42 +831,24 @@ func (ldh *LdapDataHandler) CreateGroup(c *gofsen.Context, body_bytes []byte, gr
 	case ldap.GROUP_TYPES[0]: // "Mail"
 		var group ldap.GroupMail
 		if err := json.Unmarshal(body_bytes, &group); err != nil {
-			c.Status(400).JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  "Invalid JSON: cannot be parsed to GroupMail",
-			})
+			apiError(c, http.StatusBadRequest, "Invalid JSON: cannot be parsed to GroupMail")
 			return
 		}
-		errc := ldap_client.GroupsMail.CreateGroup(group)
-		if errc == nil {
-			c.Status(201).JSON(group)
-		} else {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  errc.Message,
-			})
+		if errc := ldap_client.GroupsMail.CreateGroup(group); errc != nil {
+			apiLdapError(c, errc)
+			return
 		}
+		c.Status(http.StatusCreated).JSON(group)
 	case ldap.GROUP_TYPES[1]: // "Security"
 		var group ldap.GroupSec
 		if err := json.Unmarshal(body_bytes, &group); err != nil {
-			c.Status(400).JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  "Invalid JSON: cannot be parsed to GroupSec",
-			})
+			apiError(c, http.StatusBadRequest, "Invalid JSON: cannot be parsed to GroupSec")
 			return
 		}
-		errc := ldap_client.GroupsSec.CreateGroup(group)
-		if errc == nil {
-			c.Status(201).JSON(group)
-		} else {
-			c.JSON(map[string]any{
-				"api":    "v1",
-				"status": "error",
-				"error":  errc.Message,
-			})
+		if errc := ldap_client.GroupsSec.CreateGroup(group); errc != nil {
+			apiLdapError(c, errc)
+			return
 		}
+		c.Status(http.StatusCreated).JSON(group)
 	}
 }
