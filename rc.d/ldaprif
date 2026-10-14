@@ -1,0 +1,57 @@
+#!/bin/sh
+
+# PROVIDE: ldaprif
+# REQUIRE: DAEMON
+
+#
+# Add the following line to /etc/rc.conf to enable webhook:
+# ldaprif_enable (bool): Set to "NO" by default.
+#                        Set to "YES" to enable ldaprif.
+#
+# ldaprif_user (str): Set to "www" by default
+#                     User to run ldaprif
+#                     Check that the user has 'rw' permissions on log and run directories
+#                     and at least 'r' permissions on configuration files.
+#
+
+. /etc/rc.subr
+
+name=ldaprif
+rcvar=ldaprif_enable
+
+pidfile_child="/var/run/${name}/${name}.pid"
+pidfile="/var/run/${name}/${name}_daemon.pid"
+
+logfile="/var/log/${name}/${name}-out.log"
+ldaprif_exec="/usr/local/sbin/${name}"
+config_dir="/usr/local/etc/${name}"
+app_config="app.conf.json"
+ldap_config="ldap.conf.json"
+mail_config="mail.conf.json"
+
+command="/usr/sbin/daemon"
+procname="daemon"
+
+start_precmd="${name}_prestart"
+
+load_rc_config $name
+: ${ldaprif_enable:=no}
+
+eval "${rcvar}=\${${rcvar}:-'NO'}"
+eval "ldaprif_user=\${${name}_user:-'www'}"
+
+required_dirs="/var/run/${name} /var/log/${name} ${config_dir}"
+required_files="${config_dir}/${app_config} ${config_dir}/${ldap_config} ${config_dir}/${mail_config} ${ldaprif_exec}"
+
+ldaprif_prestart() {
+
+    rc_flags="-r -P ${pidfile} -p ${pidfile_child} -t ${name} \
+                -o ${logfile} ${ldaprif_exec} ${rc_flags}"
+
+}
+
+ldaprif_describe() {
+    echo "${name} service"
+}
+
+run_rc_command "$1"
